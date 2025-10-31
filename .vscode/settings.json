@@ -4,5 +4,6 @@
     "python.analysis.autoImportCompletions": true,
     "python.formatting.provider": "black",
     "python.linting.enabled": true,
-    "python.linting.pylintEnabled": true
+    "python.linting.pylintEnabled": true,
+    "terminal.integrated.fontSize": 16
 }
