@@ -1,0 +1,39 @@
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+.conda/
+env/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VSCode
+.vscode/.ropeproject
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data & artifacts (keep dataset local only)
+data/datasets_fin/*
+!data/datasets_fin/.gitkeep
+
+# Outputs
+outputs/
+out/
+runs/
+wandb/
+pred.csv
+*.pth
+*.pt
+*.onnx
+
+# Logs
+logs/
+*.log

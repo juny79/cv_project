@@ -1,0 +1,15 @@
+
+torch>=2.2
+torchvision>=0.17
+timm>=1.0.9
+albumentations>=1.4.3
+opencv-python-headless>=4.9
+scikit-learn>=1.4
+pandas>=2.2
+numpy>=1.26
+matplotlib>=3.8
+seaborn>=0.13
+tqdm>=4.66
+pyyaml>=6.0.1
+# optional
+augraphy>=8.1.12

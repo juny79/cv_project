@@ -1,0 +1,32 @@
+
+SEED: 42
+DATA:
+  PATH: data/datasets_fin
+  NUM_CLASSES: 17
+  FOLD_FILE: train_folds.csv
+MODEL:
+  NAME: resnet34
+  IMG_SIZE: 224
+  PRETRAINED: true
+TRAIN:
+  EPOCHS: 10
+  BATCH_SIZE: 32
+  NUM_WORKERS: 4
+  OPTIM: adamw
+  LR: 3.0e-4
+  WD: 5.0e-2
+  WARMUP_EPOCHS: 2
+  FOLD: 0
+AUG:
+  DOC_AUG: false
+  ROT_DEG: 15
+LOSS:
+  NAME: ce
+  LABEL_SMOOTHING: 0.1
+INFER:
+  TTA: 0
+OUT:
+  DIR: outputs/exp
+LOG:
+  WANDB: false
+  PROJ: doc-type-cls
