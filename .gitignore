@@ -1,11 +1,13 @@
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
+*.pyc
 *.py[cod]
 *$py.class
 
 # Virtual environments
 .venv/
+.env
 .conda/
 env/
 venv/
@@ -14,6 +16,7 @@ venv/
 .ipynb_checkpoints/
 
 # VSCode
+.vscode/
 .vscode/.ropeproject
 
 # OS
@@ -21,8 +24,11 @@ venv/
 Thumbs.db
 
 # Data & artifacts (keep dataset local only)
-data/datasets_fin/*
-!data/datasets_fin/.gitkeep
+data/train/
+data/test/
+data/**/*
+!data/.gitkeep
+!data/README.md
 
 # Outputs
 outputs/
