@@ -1,28 +1,64 @@
-
-import torch, numpy as np
-from torch.cuda.amp import autocast, GradScaler
+import torch
+from torch import nn
+from tqdm import tqdm
 from sklearn.metrics import f1_score
 
-class Trainer:
-    def __init__(self, model, optimizer, loss_fn, device):
-        self.model, self.opt, self.loss_fn, self.device = model, optimizer, loss_fn, device
-        self.scaler = GradScaler()
+def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None):
+    model.train()
+    losses = []
+    all_preds, all_tgts = [], []
+    for imgs, tgts in tqdm(loader, leave=False):
+        imgs = imgs.to(device, non_blocking=True)
+        tgts = tgts.to(device, non_blocking=True)
 
-    def run_epoch(self, loader, train=True):
-        self.model.train(train)
-        losses, preds_all, t_all = [], [], []
-        for imgs, targets in loader:
-            imgs, targets = imgs.to(self.device), targets.to(self.device)
-            with autocast():
-                logits = self.model(imgs)
-                loss = self.loss_fn(logits, targets)
-            if train:
-                self.opt.zero_grad(set_to_none=True)
-                self.scaler.scale(loss).backward()
-                self.scaler.step(self.opt)
-                self.scaler.update()
-            losses.append(loss.item())
-            preds_all.extend(logits.argmax(1).detach().cpu().numpy())
-            t_all.extend(targets.detach().cpu().numpy())
-        f1 = f1_score(t_all, preds_all, average='macro')
-        return float(np.mean(losses)), float(f1)
+        optimizer.zero_grad(set_to_none=True)
+        with torch.cuda.amp.autocast(enabled=(scaler is not None)):
+            logits = model(imgs)
+            loss = criterion(logits, tgts)
+
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
+
+        losses.append(loss.item())
+        all_preds.extend(torch.argmax(logits, 1).detach().cpu().tolist())
+        all_tgts.extend(tgts.detach().cpu().tolist())
+
+    f1 = f1_score(all_tgts, all_preds, average='macro')
+    return sum(losses)/len(losses), f1
+
+@torch.no_grad()
+def valid_one_epoch(model, loader, criterion, device):
+    model.eval()
+    losses = []
+    all_preds, all_tgts = [], []
+    for imgs, tgts in tqdm(loader, leave=False):
+        imgs = imgs.to(device, non_blocking=True)
+        tgts = tgts.to(device, non_blocking=True)
+        logits = model(imgs)
+        loss = criterion(logits, tgts)
+        losses.append(loss.item())
+        all_preds.extend(torch.argmax(logits, 1).detach().cpu().tolist())
+        all_tgts.extend(tgts.detach().cpu().tolist())
+    f1 = f1_score(all_tgts, all_preds, average='macro')
+    return sum(losses)/len(losses), f1
+
+class EarlyStopper:
+    def __init__(self, patience=3, mode='max'):
+        self.patience = patience
+        self.mode = mode
+        self.best = None
+        self.count = 0
+
+    def step(self, value):
+        improved = (value > self.best) if (self.best is not None) else True
+        if improved:
+            self.best = value
+            self.count = 0
+        else:
+            self.count += 1
+        return improved, self.count >= self.patience
