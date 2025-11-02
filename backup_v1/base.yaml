@@ -1,0 +1,33 @@
+seed: 42
+device: auto            # auto|cuda|cpu
+num_workers: 2
+
+paths:
+  base_dir: /root/cv_project/data
+  train_csv: /root/cv_project/data/train.csv
+  folds_csv: /root/cv_project/data/train_folds.csv
+  sample_csv: /root/cv_project/data/sample_submission.csv
+  train_dir: /root/cv_project/data/train
+  test_dir:  /root/cv_project/data/test
+  out_dir:   /root/cv_project/outputs
+
+data:
+  img_size: 224
+  n_splits: 5
+  folds: [0,1,2,3,4]    # 선택 실행 가능, 예: [0]
+
+model:
+  name: EfficientNetV2-S         # timm 모델 이름
+  pretrained: true
+  dropout: 0.1
+
+train:
+  epochs: 10
+  batch_size: 32
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  scheduler: cosine      # cosine|onecycle|none
+  mix_precision: true    # AMP
+  early_stop_patience: 3
+  class_weight: balanced # none|balanced
+  metric: f1_macro       # 저장 기준
