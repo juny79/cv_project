@@ -1,0 +1,33 @@
+seed: 42
+device: auto
+num_workers: 4
+
+paths:
+  base_dir: /root/cv_project/data
+  train_csv: /root/cv_project/data/train.csv
+  folds_csv: /root/cv_project/data/train_folds.csv
+  sample_csv: /root/cv_project/data/sample_submission.csv
+  train_dir: /root/cv_project/data/train
+  test_dir:  /root/cv_project/data/test
+  out_dir:   /root/cv_project/outputs
+
+data:
+  img_size: 640
+  n_splits: 5
+  folds: [0,1,2,3,4]
+
+model:
+  name: efficientnetv2_s    # convnext_tiny / resnet50 등 교체 테스트
+  pretrained: true
+  dropout: 0.1
+
+train:
+  epochs: 12
+  batch_size: 24           # 640 사이즈면 메모리에 맞게 조정
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  scheduler: cosine        # cosine|onecycle
+  mix_precision: true
+  early_stop_patience: 3
+  class_weight: balanced
+  metric: f1_macro
