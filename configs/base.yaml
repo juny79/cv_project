@@ -1,6 +1,7 @@
+# configs/base.yaml
 seed: 42
 device: auto
-num_workers: 4
+num_workers: 2
 
 paths:
   base_dir: /root/cv_project/data
@@ -8,26 +9,28 @@ paths:
   folds_csv: /root/cv_project/data/train_folds.csv
   sample_csv: /root/cv_project/data/sample_submission.csv
   train_dir: /root/cv_project/data/train
-  test_dir:  /root/cv_project/data/test
-  out_dir:   /root/cv_project/outputs
+  test_dir: /root/cv_project/data/test
+  out_dir: /root/cv_project/outputs
+  processed_train: /root/cv_project/data/processed_v2/train_processed.pt
 
 data:
-  img_size: 640
   n_splits: 5
-  folds: [0,1,2,3,4]
+  folds: [0, 1, 2, 3, 4]
+  img_size: 640
 
 model:
-  name: efficientnetv2_s    # convnext_tiny / resnet50 등 교체 테스트
+  # 체크포인트와 일치하는 모델 (FC layer [17, 512] 기준)
+  name: resnet34
   pretrained: true
   dropout: 0.1
 
 train:
-  epochs: 12
-  batch_size: 24           # 640 사이즈면 메모리에 맞게 조정
-  lr: 3.0e-4
-  weight_decay: 1.0e-4
-  scheduler: cosine        # cosine|onecycle
-  mix_precision: true
+  epochs: 10            # 숫자(따옴표 X)
+  batch_size: 32        # 숫자(따옴표 X)
+  lr: 3e-4              # 숫자(따옴표 X)
+  weight_decay: 1e-4    # 숫자(따옴표 X)
+  scheduler: cosine     # cosine | onecycle
   early_stop_patience: 3
-  class_weight: balanced
+  mix_precision: true
+  class_weight: balanced   # balanced | none
   metric: f1_macro

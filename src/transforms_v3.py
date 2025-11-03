@@ -146,3 +146,6 @@ def get_valid_transforms_v3(img_size=640):
         A.Normalize(mean=(0.5,0.5,0.5), std=(0.5,0.5,0.5)),
         ToTensorV2()
     ])
+# src/transforms.py (파일 맨 아래 추가)
+get_train_transforms = get_train_transforms_v3
+get_valid_transforms = get_valid_transforms_v3

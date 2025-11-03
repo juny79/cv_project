@@ -4,7 +4,14 @@ import numpy as np
 import pandas as pd
 from torch.utils.data import DataLoader, Dataset
 from PIL import Image
-from src.transforms import get_valid_transforms  # v3 재수출 사용
+# import transforms robustly (some environments may fail direct-from-import)
+try:
+    from src.transforms import get_valid_transforms
+except Exception:
+    import src.transforms as _transforms
+    get_valid_transforms = getattr(_transforms, 'get_valid_transforms', None)
+    if get_valid_transforms is None:
+        raise ImportError('src.transforms does not provide get_valid_transforms')
 
 def load_cfg(p):
     with open(p,'r') as f: return yaml.safe_load(f)
@@ -34,9 +41,21 @@ class TestDS(Dataset):
 def predict_ensemble(cfg_path, tta=0):
     cfg = load_cfg(cfg_path)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    tfm = get_valid_transforms(cfg['data']['img_size'])
-    test = TestDS(cfg['paths']['sample_csv'], cfg['paths']['test_dir'], tfm)
-    loader = DataLoader(test, batch_size=cfg['train'].get('batch_size', 32), shuffle=False, num_workers=2)
+    # defensive config reads with helpful error messages
+    data_cfg = cfg.get('data', {})
+    paths = cfg.get('paths', {})
+    if 'img_size' not in data_cfg:
+        raise ValueError('Missing config: data.img_size')
+    if 'sample_csv' not in paths:
+        raise ValueError('Missing config: paths.sample_csv (path to sample_submission.csv)')
+    if 'test_dir' not in paths:
+        raise ValueError('Missing config: paths.test_dir (directory with test images)')
+
+    tfm = get_valid_transforms(data_cfg['img_size'])
+    test = TestDS(paths['sample_csv'], paths['test_dir'], tfm)
+    num_workers = cfg.get('num_workers', 2)
+    batch_size = cfg.get('train', {}).get('batch_size', 32)
+    loader = DataLoader(test, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
     # fold ckpts 수집
     ckpts = []
@@ -57,7 +76,21 @@ def predict_ensemble(cfg_path, tta=0):
     all_logits = []
     for ck in ckpts:
         w = torch.load(ck, map_location=device)
-        model.load_state_dict(w['model'], strict=False)
+        try:
+            model.load_state_dict(w['model'], strict=False)
+        except RuntimeError as e:
+            # shape mismatch between checkpoint and model -> fallback to partial load
+            print(f"[WARN] state_dict load failed for {ck}: {e}\nAttempting partial weight load by shape match...")
+            model_sd = model.state_dict()
+            ck_sd = w.get('model', w)
+            matched = {}
+            for k, v in ck_sd.items():
+                if k in model_sd and model_sd[k].shape == v.shape:
+                    matched[k] = v
+            if not matched:
+                raise RuntimeError(f'No matching parameter shapes found between checkpoint {ck} and model.')
+            model_sd.update(matched)
+            model.load_state_dict(model_sd)
         model.eval()
 
         fold_logits = []
@@ -77,14 +110,21 @@ def predict_ensemble(cfg_path, tta=0):
         all_logits.append(fold_logits)
 
     mean_logits = torch.stack(all_logits).mean(0)
+    probs = torch.softmax(mean_logits, dim=1)
     preds = mean_logits.argmax(1).numpy()
+    max_probs = probs.max(1).values.numpy()
+    fold_agreement = torch.tensor([(l.argmax(1).numpy() == preds).mean() for l in all_logits]).mean().item()
 
     sub = pd.read_csv(cfg['paths']['sample_csv'])
     # 정답 컬럼명 찾기
     ycol = [c for c in sub.columns if c.lower() in ['label','target','class']]
     ycol = ycol[0] if ycol else sub.columns[-1]
     sub[ycol] = preds
-    out_csv = os.path.join(cfg['paths']['out_dir'], 'submission.csv')
+    sub['confidence'] = max_probs
+    sub['fold_agreement'] = fold_agreement
+    out_dir = paths.get('out_dir', './outputs')
+    os.makedirs(out_dir, exist_ok=True)
+    out_csv = os.path.join(out_dir, 'submission.csv')
     sub.to_csv(out_csv, index=False)
     print(f'Saved → {out_csv}')
     return out_csv
