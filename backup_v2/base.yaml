@@ -1,0 +1,34 @@
+# configs/base.yaml
+seed: 42
+device: auto
+num_workers: 2
+
+paths:
+  base_dir: /root/cv_project/data
+  train_csv: /root/cv_project/data/train.csv
+  train_dir: /root/cv_project/data/train
+  test_dir: /root/cv_project/data/test
+  out_dir: /root/cv_project/outputs
+  processed_train: /root/cv_project/data/processed_v2/train_processed.pt
+
+data:
+  n_splits: 5
+  folds: [0, 1, 2, 3, 4]
+  img_size: 640
+
+model:
+  # 필요시 다른 모델명으로 교체 가능 (ex. efficientnetv2_s, tf_efficientnetv2_s 등)
+  name: efficientnetv2_s
+  pretrained: true
+  dropout: 0.1
+
+train:
+  epochs: 10            # 숫자(따옴표 X)
+  batch_size: 32        # 숫자(따옴표 X)
+  lr: 3e-4              # 숫자(따옴표 X)
+  weight_decay: 1e-4    # 숫자(따옴표 X)
+  scheduler: cosine     # cosine | onecycle
+  early_stop_patience: 3
+  mix_precision: true
+  class_weight: balanced   # balanced | none
+  metric: f1_macro
