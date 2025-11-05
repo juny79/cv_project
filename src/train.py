@@ -1,329 +1,219 @@
-# src/train.py  (cache-enabled + safe pretrained fallback + 타입 가드)
-import os, yaml, timm, torch, random
-import numpy as np
-import pandas as pd
-from argparse import ArgumentParser
-from sklearn.model_selection import StratifiedKFold
-from sklearn.utils.class_weight import compute_class_weight
-from torch.utils.data import DataLoader, TensorDataset
+# src/train.py
+import os, yaml, random, timm, torch
+import numpy as np, pandas as pd
 from torch import nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import f1_score
+from PIL import Image
+from src.preprocessing import get_train_transforms, get_valid_transforms
 
-from src.engine import train_one_epoch, valid_one_epoch, EarlyStopper
-from src.transforms import get_train_transforms, get_valid_transforms
+# ---------------- utils ----------------
+def set_seed(s=42):
+    random.seed(s); np.random.seed(s); torch.manual_seed(s)
+    torch.cuda.manual_seed_all(s)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
 
-# ------------------ 공통 유틸 ------------------
-def set_seed(seed=42):
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    random.seed(seed); np.random.seed(seed)
-    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+def load_cfg(p):
+    with open(p,'r') as f: return yaml.safe_load(f)
 
-def auto_device(name):
-    if name == 'cuda' and torch.cuda.is_available(): return 'cuda'
-    if name == 'auto': return 'cuda' if torch.cuda.is_available() else 'cpu'
-    return 'cpu'
+class ImgDS(Dataset):
+    exts = ('.jpg','.jpeg','.png','.JPG','.PNG','.JPEG','')
+    def __init__(self, csv, img_dir, transform, has_label=True):
+        self.df = pd.read_csv(csv)
+        self.dir = img_dir
+        self.tf = transform
+        self.has_label = has_label
+        idc = [c for c in self.df.columns if 'id' in c.lower() or 'file' in c.lower()]
+        self.id_col = idc[0] if idc else self.df.columns[0]
+        if has_label:
+            lcs = [c for c in self.df.columns if c.lower() in ['target','label','class']]
+            self.y_col = lcs[0] if lcs else self.df.columns[-1]
+    def __len__(self): return len(self.df)
+    def __getitem__(self, i):
+        row = self.df.iloc[i]
+        stem = str(row[self.id_col])
+        img = None
+        for e in self.exts:
+            p = os.path.join(self.dir, stem+e)
+            if os.path.exists(p):
+                img = np.array(Image.open(p).convert('RGB')); break
+        if img is None:
+            raise FileNotFoundError(stem)
+        x = self.tf(image=img)['image']
+        y = int(row[self.y_col]) if self.has_label else -1
+        return x, y
 
-def load_cfg(path):
-    with open(path, 'r') as f: return yaml.safe_load(f)
+# ----------- EMA (optional) -----------
+class EMA:
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    @torch.no_grad()
+    def update(self, model):
+        for k, v in model.state_dict().items():
+            if v.dtype.is_floating_point:
+                self.shadow[k].mul_(self.decay).add_(v, alpha=1-self.decay)
+    def apply_to(self, model):
+        model.load_state_dict(self.shadow, strict=False)
 
-def ensure_folds_from_df(df, label_col, n_splits=5, seed=42):
-    out = df.copy()
-    if 'fold' in out.columns and not out['fold'].isna().any():
-        return out
-    y = out[label_col].astype(str).values
-    y_enc, _ = pd.factorize(y)
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    folds = np.full(len(out), -1, dtype=int)
-    for k, (_, va_idx) in enumerate(skf.split(np.zeros(len(y_enc)), y_enc)):
-        folds[va_idx] = k
-    out['fold'] = folds
-    return out
+# -------- Label smoothing CE ----------
+class SmoothCE(nn.Module):
+    def __init__(self, eps=0.05):
+        super().__init__(); self.eps = eps; self.ce = nn.CrossEntropyLoss()
+    def forward(self, logits, target):
+        if self.eps<=0: return self.ce(logits, target)
+        num_classes = logits.size(-1)
+        with torch.no_grad():
+            true_dist = torch.zeros_like(logits)
+            true_dist.fill_(self.eps / (num_classes - 1))
+            true_dist.scatter_(1, target.unsqueeze(1), 1 - self.eps)
+        logp = torch.log_softmax(logits, dim=1)
+        return -(true_dist * logp).sum(dim=1).mean()
 
-def get_scheduler(cfg, optimizer, steps_per_epoch):
-    sch = str(cfg['train'].get('scheduler', 'cosine')).lower()
-    epochs = int(cfg['train'].get('epochs', 10))
-    if sch == 'onecycle':
-        from torch.optim.lr_scheduler import OneCycleLR
-        return OneCycleLR(optimizer, max_lr=float(cfg['train'].get('lr', 3e-4)),
-                          steps_per_epoch=steps_per_epoch, epochs=epochs)
-    else:
-        from torch.optim.lr_scheduler import CosineAnnealingLR
-        return CosineAnnealingLR(optimizer, T_max=epochs)
+# -------- MixUp / CutMix (light) ------
+def do_mix(inputs, targets, alpha):
+    if alpha<=0: return inputs, targets, None
+    lam = np.random.beta(alpha, alpha)
+    idx = torch.randperm(inputs.size(0), device=inputs.device)
+    x = lam*inputs + (1-lam)*inputs[idx]
+    return x, (targets, targets[idx], lam), 'mixup'
 
-def save_checkpoint(path, model, optimizer, scaler, epoch, metrics, classes):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save({
-        'model': model.state_dict(),
-        'optimizer': optimizer.state_dict(),
-        'scaler': scaler.state_dict() if scaler is not None else None,
-        'epoch': epoch,
-        'metrics': metrics,
-        'classes': list(classes)
-    }, path)
+def do_cutmix(inputs, targets, alpha):
+    if alpha<=0: return inputs, targets, None
+    lam = np.random.beta(alpha, alpha)
+    B, C, H, W = inputs.size()
+    cx, cy = np.random.randint(W), np.random.randint(H)
+    w = int(W*np.sqrt(1-lam)); h = int(H*np.sqrt(1-lam))
+    x1, y1 = np.clip(cx-w//2, 0, W), np.clip(cy-h//2, 0, H)
+    x2, y2 = np.clip(cx+w//2, 0, W), np.clip(cy+h//2, 0, H)
+    idx = torch.randperm(B, device=inputs.device)
+    inputs[:, :, y1:y2, x1:x2] = inputs[idx, :, y1:y2, x1:x2]
+    lam2 = 1 - ((x2-x1)*(y2-y1)/(W*H))
+    return inputs, (targets, targets[idx], lam2), 'cutmix'
 
-def parse_train_hparams(cfg):
-    tr = cfg['train']
-    # 모든 하이퍼파라미터를 안전 캐스팅
-    return {
-        'epochs': int(tr.get('epochs', 10)),
-        'batch_size': int(tr.get('batch_size', 32)),
-        'lr': float(tr.get('lr', 3e-4)),
-        'weight_decay': float(tr.get('weight_decay', 1e-4)),
-        'scheduler': str(tr.get('scheduler', 'cosine')).lower(),
-        'mix_precision': bool(tr.get('mix_precision', True)),
-        'early_stop_patience': int(tr.get('early_stop_patience', 3)),
-        'class_weight': str(tr.get('class_weight', 'none')).lower(),
-    }
+def mix_loss(criterion, logits, mix_tgt):
+    y1, y2, lam = mix_tgt
+    return lam*criterion(logits, y1) + (1-lam)*criterion(logits, y2)
 
-# ---------- 안전 모델 생성기: pretrained 없으면 자동 폴백 ----------
-_ALIAS = {
-    "efficientnetv2_s": "tf_efficientnetv2_s",
-    "efficientnetv2_m": "tf_efficientnetv2_m",
-    "efficientnetv2_l": "tf_efficientnetv2_l",
-}
+# -------------- train/eval --------------
+def train_one_epoch(model, loader, opt, criterion, device, scaler=None,
+                    mixup=0.1, cutmix=0.1, ema: EMA|None=None):
+    model.train()
+    losses, preds, tgts = [], [], []
+    for xb, yb in loader:
+        xb, yb = xb.to(device), yb.to(device)
+        mix_tgt = None; kind = None
+        r = np.random.rand()
+        if r < cutmix: xb, mix_tgt, kind = do_cutmix(xb, yb, cutmix)
+        elif r < cutmix + mixup: xb, mix_tgt, kind = do_mix(xb, yb, mixup)
 
-def create_timm_model_safe(name: str, pretrained: bool, num_classes: int, device: str):
-    try:
-        model = timm.create_model(name, pretrained=pretrained, num_classes=num_classes)
-        return model.to(device)
-    except RuntimeError as e:
-        msg = str(e)
-        if "No pretrained weights exist" in msg and pretrained:
-            if name in _ALIAS:
-                alias = _ALIAS[name]
-                print(f"[WARN] '{name}' pretrained 없음 → '{alias}'로 재시도")
-                try:
-                    model = timm.create_model(alias, pretrained=True, num_classes=num_classes)
-                    return model.to(device)
-                except Exception as e2:
-                    print(f"[WARN] '{alias}'도 실패: {e2}. → pretrained=False로 폴백")
+        opt.zero_grad(set_to_none=True)
+        with torch.cuda.amp.autocast(enabled=scaler is not None):
+            logits = model(xb)
+            if mix_tgt is None:
+                loss = criterion(logits, yb)
             else:
-                print(f"[WARN] '{name}' pretrained 없음 → pretrained=False로 폴백")
-            model = timm.create_model(name, pretrained=False, num_classes=num_classes)
-            return model.to(device)
-        raise
-
-# =================== A) 캐시(.pt) 직접 학습 ===================
-def run_training_with_cache(cfg, device):
-    paths = cfg.get('paths', {})
-    processed_train = paths.get('processed_train', '/root/cv_project/data/processed_v2/train_processed.pt')
-    out_dir = paths.get('out_dir', './outputs'); os.makedirs(out_dir, exist_ok=True)
-
-    if not os.path.exists(processed_train):
-        raise FileNotFoundError(f"Processed train file not found: {processed_train}. Run preprocessing pipeline to generate it or set paths.processed_train in config.")
-
-    state = torch.load(processed_train, map_location='cpu')
-    images = state['images']                # [N,3,H,W]
-    labels = state['labels']                # [N]
-
-    if labels.numel() == 0:
-        raise ValueError("캐시 텐서에 labels 가 없습니다. 학습용 캐시를 생성했는지 확인하세요.")
-
-    y_np = labels.detach().cpu().numpy()
-    if not np.issubdtype(y_np.dtype, np.integer):
-        y_enc, classes = pd.factorize(y_np.astype(str))
-        labels = torch.from_numpy(y_enc).long()
-        classes = np.asarray(classes)
-    else:
-        classes = np.unique(y_np)
-
-    n_splits = int(cfg['data'].get('n_splits', 5))
-    folds = cfg['data'].get('folds', list(range(n_splits)))
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=cfg.get('seed', 42))
-    y_for_split = labels.detach().cpu().numpy()
-    split_map = {k: pair for k, pair in enumerate(skf.split(np.zeros(len(y_for_split)), y_for_split))}
-
-    hp = parse_train_hparams(cfg)
-    all_fold_metrics = {}
-    num_classes = int(len(classes))
-    bs = hp['batch_size']
-
-    for fold in folds:
-        print(f"\n========== Fold {fold} (cache) ==========")
-        tr_idx, va_idx = split_map[fold]
-
-        tr_ds = TensorDataset(images[tr_idx], labels[tr_idx])
-        va_ds = TensorDataset(images[va_idx], labels[va_idx])
-
-        tr_loader = DataLoader(tr_ds, batch_size=bs, shuffle=True,
-                               num_workers=int(cfg.get('num_workers', 2)), pin_memory=True)
-        va_loader = DataLoader(va_ds, batch_size=bs, shuffle=False,
-                               num_workers=int(cfg.get('num_workers', 2)), pin_memory=True)
-
-        model = create_timm_model_safe(cfg['model']['name'],
-                                       bool(cfg['model'].get('pretrained', True)),
-                                       num_classes, device)
-
-        if hp['class_weight'] == 'balanced':
-            w = compute_class_weight(class_weight='balanced',
-                                     classes=np.arange(num_classes),
-                                     y=y_for_split[tr_idx])
-            weight = torch.tensor(w, dtype=torch.float32, device=device)
-            criterion = nn.CrossEntropyLoss(weight=weight)
+                loss = mix_loss(criterion, logits, mix_tgt)
+        if scaler:
+            scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
         else:
-            criterion = nn.CrossEntropyLoss()
+            loss.backward(); opt.step()
+        if ema: ema.update(model)
 
-        optimizer = torch.optim.AdamW(model.parameters(),
-                                      lr=hp['lr'],
-                                      weight_decay=hp['weight_decay'])
-        scaler = torch.cuda.amp.GradScaler(enabled=hp['mix_precision'] and device=='cuda')
-        scheduler = get_scheduler(cfg, optimizer, steps_per_epoch=len(tr_loader))
-        early = EarlyStopper(patience=hp['early_stop_patience'], mode='max')
+        losses.append(loss.item())
+        preds.extend(torch.argmax(logits,1).detach().cpu().tolist())
+        tgts.extend(yb.detach().cpu().tolist())
+    f1 = f1_score(tgts, preds, average='macro')
+    return float(np.mean(losses)), f1
 
-        best_path = os.path.join(out_dir, f'fold{fold}', 'best.pt')
-        best_f1 = -1.0
-        epochs = hp['epochs']
+@torch.no_grad()
+def evaluate(model, loader, criterion, device):
+    model.eval()
+    losses, preds, tgts = [], [], []
+    for xb, yb in loader:
+        xb, yb = xb.to(device), yb.to(device)
+        logits = model(xb)
+        loss = criterion(logits, yb)
+        losses.append(loss.item())
+        preds.extend(torch.argmax(logits,1).cpu().tolist())
+        tgts.extend(yb.cpu().tolist())
+    f1 = f1_score(tgts, preds, average='macro')
+    return float(np.mean(losses)), f1
 
-        for epoch in range(1, epochs+1):
-            print(f"[Fold {fold}] Epoch {epoch}/{epochs} (cache)")
-            tr_loss, tr_f1 = train_one_epoch(model, tr_loader, criterion, optimizer, device, scaler)
-            va_loss, va_f1 = valid_one_epoch(model, va_loader, criterion, device)
-            scheduler.step()
-            print(f"Train | loss={tr_loss:.4f} f1={tr_f1:.4f}  ||  Valid | loss={va_loss:.4f} f1={va_f1:.4f}")
-
-            if early.step(va_f1):
-                best_f1 = va_f1
-                save_checkpoint(best_path, model, optimizer, scaler, epoch,
-                                metrics={'train_loss':tr_loss, 'train_f1':tr_f1, 'valid_loss':va_loss, 'valid_f1':va_f1},
-                                classes=classes)
-                print(f"✓ Best updated (F1={va_f1:.4f}) → {best_path}")
-
-            if early.should_stop():
-                print("Early stopping triggered.")
-                break
-
-        all_fold_metrics[fold] = best_f1
-
-    print("\n==== Summary (Best F1 per fold, cache) ====")
-    for k,v in all_fold_metrics.items():
-        print(f"Fold {k}: F1={v:.4f}")
-    print("Saved checkpoints under:", out_dir)
-
-# =================== B) 실시간 전처리 학습 ===================
-def run_training_realtime(cfg, device):
-    from src.datasets import DocumentDataset
-
-    paths = cfg.get('paths', {})
-    train_csv = paths.get('train_csv')
-    train_dir = paths.get('train_dir')
-    out_dir   = paths.get('out_dir', './outputs')
-    if train_csv is None or not os.path.exists(train_csv):
-        raise FileNotFoundError(f"train_csv not found or not set in config.paths: {train_csv}")
-    if train_dir is None or not os.path.exists(train_dir):
-        raise FileNotFoundError(f"train_dir not found or not set in config.paths: {train_dir}")
-    os.makedirs(out_dir, exist_ok=True)
-
-    df = pd.read_csv(train_csv)
-    cand_lb = [c for c in df.columns if c.lower() in ['label','target','class','y']]
-    label_col = cand_lb[0] if cand_lb else df.columns[-1]
-    df = ensure_folds_from_df(df, label_col, n_splits=int(cfg['data'].get('n_splits',5)), seed=cfg.get('seed',42))
-
-    classes_global = np.unique(df[label_col].astype(str).values)
-    num_classes = len(classes_global)
-
-    img_size = int(cfg['data'].get('img_size', 640))
-    t_train = get_train_transforms(img_size)
-    t_valid = get_valid_transforms(img_size)
-
-    folds = cfg['data'].get('folds', list(range(int(cfg['data'].get('n_splits', 5)))))
-    hp = parse_train_hparams(cfg)
-    all_fold_metrics = {}
-
-    for fold in folds:
-        print(f"\n========== Fold {fold} (realtime) ==========")
-        tr_idx = df.index[df['fold'] != fold].tolist()
-        va_idx = df.index[df['fold'] == fold].tolist()
-
-        id_cols = [c for c in df.columns if 'id' in c.lower() or 'file' in c.lower()]
-        id_col = id_cols[0] if id_cols else df.columns[0]
-
-        tmp_dir = os.path.join(out_dir, '_tmp_csv'); os.makedirs(tmp_dir, exist_ok=True)
-        tr_csv = os.path.join(tmp_dir, f'train_fold{fold}.csv')
-        va_csv = os.path.join(tmp_dir, f'valid_fold{fold}.csv')
-
-        tr_df = df.loc[tr_idx, [id_col, label_col]].rename(columns={label_col:'label'})
-        va_df = df.loc[va_idx, [id_col, label_col]].rename(columns={label_col:'label'})
-
-        tr_df['label'] = pd.Categorical(tr_df['label'].astype(str), categories=classes_global).codes
-        va_df['label'] = pd.Categorical(va_df['label'].astype(str), categories=classes_global).codes
-
-        tr_df.to_csv(tr_csv, index=False)
-        va_df.to_csv(va_csv, index=False)
-
-        tr_ds = DocumentDataset(tr_csv, train_dir, transform=t_train, has_label=True, id_col=id_col, label_col='label')
-        va_ds = DocumentDataset(va_csv, train_dir, transform=t_valid, has_label=True, id_col=id_col, label_col='label')
-
-        tr_loader = DataLoader(tr_ds, batch_size=hp['batch_size'], shuffle=True,
-                               num_workers=int(cfg.get('num_workers', 2)), pin_memory=True)
-        va_loader = DataLoader(va_ds, batch_size=hp['batch_size'], shuffle=False,
-                               num_workers=int(cfg.get('num_workers', 2)), pin_memory=True)
-
-        model = create_timm_model_safe(cfg['model']['name'],
-                                       bool(cfg['model'].get('pretrained', True)),
-                                       num_classes, device)
-
-        if hp['class_weight'] == 'balanced':
-            y_tr = tr_df['label'].values
-            w = compute_class_weight(class_weight='balanced',
-                                     classes=np.arange(num_classes),
-                                     y=y_tr)
-            weight = torch.tensor(w, dtype=torch.float32, device=device)
-            criterion = nn.CrossEntropyLoss(weight=weight)
-        else:
-            criterion = nn.CrossEntropyLoss()
-
-        optimizer = torch.optim.AdamW(model.parameters(),
-                                      lr=hp['lr'],
-                                      weight_decay=hp['weight_decay'])
-        scaler = torch.cuda.amp.GradScaler(enabled=hp['mix_precision'] and device=='cuda')
-        scheduler = get_scheduler(cfg, optimizer, steps_per_epoch=len(tr_loader))
-        early = EarlyStopper(patience=hp['early_stop_patience'], mode='max')
-
-        best_path = os.path.join(out_dir, f'fold{fold}', 'best.pt')
-        best_f1 = -1.0
-        epochs = hp['epochs']
-
-        for epoch in range(1, epochs+1):
-            print(f"[Fold {fold}] Epoch {epoch}/{epochs} (realtime)")
-            tr_loss, tr_f1 = train_one_epoch(model, tr_loader, criterion, optimizer, device, scaler)
-            va_loss, va_f1 = valid_one_epoch(model, va_loader, criterion, device)
-            scheduler.step()
-            print(f"Train | loss={tr_loss:.4f} f1={tr_f1:.4f}  ||  Valid | loss={va_loss:.4f} f1={va_f1:.4f}")
-
-            if early.step(va_f1):
-                best_f1 = va_f1
-                save_checkpoint(best_path, model, optimizer, scaler, epoch,
-                                metrics={'train_loss':tr_loss, 'train_f1':tr_f1, 'valid_loss':va_loss, 'valid_f1':va_f1},
-                                classes=classes_global)
-                print(f"✓ Best updated (F1={va_f1:.4f}) → {best_path}")
-
-            if early.should_stop():
-                print("Early stopping triggered.")
-                break
-
-        all_fold_metrics[fold] = best_f1
-
-    print("\n==== Summary (Best F1 per fold, realtime) ====")
-    for k,v in all_fold_metrics.items():
-        print(f"Fold {k}: F1={v:.4f}")
-    print("Saved checkpoints under:", out_dir)
-
-# ------------------ entry ------------------
+# -------------- main --------------------
 def main():
-    ap = ArgumentParser()
+    import argparse
+    ap = argparse.ArgumentParser()
     ap.add_argument('--config', required=True)
-    ap.add_argument('--use-cache', action='store_true', help='전처리 캐시(.pt)에서 바로 학습')
     args = ap.parse_args()
 
-    cfg = load_cfg(args.config)
-    set_seed(cfg.get('seed', 42))
-    device = auto_device(cfg.get('device', 'auto'))
+    cfg = load_cfg(args.config); set_seed(cfg.get('seed',42))
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    if args.use_cache:
-        run_training_with_cache(cfg, device)
-    else:
-        run_training_realtime(cfg, device)
+    paths, data, tr = cfg['paths'], cfg['data'], cfg['train']
+    img_size = int(data['img_size'])
+
+    df = pd.read_csv(paths['train_csv'])
+    ycol = [c for c in df.columns if c.lower() in ['target','label','class']]
+    ycol = ycol[0] if ycol else df.columns[-1]
+    X = df.index.values; y = df[ycol].values
+
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=cfg.get('seed',42))
+    for fold, (tr_idx, va_idx) in enumerate(skf.split(X, y)):
+        print(f"\n========== Fold {fold} ==========")
+        tr_tf = get_train_transforms(img_size)
+        va_tf = get_valid_transforms(img_size)
+        tr_ds = ImgDS(paths['train_csv'], paths['train_dir'], tr_tf, True)
+        va_ds = ImgDS(paths['train_csv'], paths['train_dir'], va_tf, True)
+        tr_ds.df = tr_ds.df.iloc[tr_idx].reset_index(drop=True)
+        va_ds.df = va_ds.df.iloc[va_idx].reset_index(drop=True)
+
+        tr_loader = DataLoader(tr_ds, batch_size=tr['batch_size'], shuffle=True,
+                               num_workers=tr.get('num_workers',2), pin_memory=True)
+        va_loader = DataLoader(va_ds, batch_size=tr['batch_size'], shuffle=False,
+                               num_workers=tr.get('num_workers',2), pin_memory=True)
+
+        model = timm.create_model(cfg['model']['name'],
+                                  pretrained=cfg['model'].get('pretrained', True),
+                                  num_classes=int(data['num_classes'])).to(device)
+        if cfg['model'].get('dropout'):
+            if hasattr(model, 'drop_rate'): model.drop_rate = cfg['model']['dropout']
+
+        criterion = SmoothCE(eps=tr.get('label_smoothing',0.0)).to(device)
+        opt = torch.optim.AdamW(model.parameters(), lr=float(tr['lr']),
+                                weight_decay=float(tr['weight_decay']))
+        if tr['scheduler'] == 'cosine':
+            sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=tr['epochs'])
+        else:
+            sch = None
+        scaler = torch.cuda.amp.GradScaler(enabled=tr.get('amp', True))
+        ema = EMA(model) if tr.get('ema', True) else None
+
+        best_f1, es_cnt = -1, 0
+        out_fold = os.path.join(paths['out_dir'], f'fold{fold}')
+        os.makedirs(out_fold, exist_ok=True)
+
+        for ep in range(1, tr['epochs']+1):
+            tl, tf1 = train_one_epoch(model, tr_loader, opt, criterion, device, scaler,
+                                      mixup=tr.get('mixup_alpha',0.0),
+                                      cutmix=tr.get('cutmix_alpha',0.0),
+                                      ema=ema)
+            if ema: ema.apply_to(model)
+            vl, vf1 = evaluate(model, va_loader, criterion, device)
+            if sch: sch.step()
+
+            print(f"[Fold {fold}] Ep {ep}/{tr['epochs']} | Train loss {tl:.4f} f1 {tf1:.4f} | Valid loss {vl:.4f} f1 {vf1:.4f}")
+            if vf1 > best_f1:
+                best_f1 = vf1; es_cnt = 0
+                torch.save({'model': model.state_dict()}, os.path.join(out_fold, 'best.pt'))
+            else:
+                es_cnt += 1
+                if es_cnt >= tr['early_stop_patience']:
+                    print(f"[Fold {fold}] Early stop. Best F1={best_f1:.4f}")
+                    break
+        print(f"[Fold {fold}] Best F1: {best_f1:.4f}")
 
 if __name__ == '__main__':
     main()

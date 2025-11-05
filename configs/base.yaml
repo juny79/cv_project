@@ -1,36 +1,33 @@
 # configs/base.yaml
 seed: 42
-device: auto
-num_workers: 2
 
 paths:
-  base_dir: /root/cv_project/data
   train_csv: /root/cv_project/data/train.csv
-  folds_csv: /root/cv_project/data/train_folds.csv
   sample_csv: /root/cv_project/data/sample_submission.csv
   train_dir: /root/cv_project/data/train
-  test_dir: /root/cv_project/data/test
-  out_dir: /root/cv_project/outputs
-  processed_train: /root/cv_project/data/processed_v2/train_processed.pt
+  test_dir:  /root/cv_project/data/test
+  out_dir:   /root/cv_project/outputs
 
 data:
-  n_splits: 5
-  folds: [0, 1, 2, 3, 4]
-  img_size: 640
+  num_classes: 17
+  img_size: 704              # ← 여기만 바꾸면 train/predict 모두 반영
+  folds: [0,1,2,3,4]
 
 model:
-  # 체크포인트와 일치하는 모델 (FC layer [17, 512] 기준)
-  name: resnet34
+  name: efficientnetv2_s
   pretrained: true
   dropout: 0.1
 
 train:
-  epochs: 10            # 숫자(따옴표 X)
-  batch_size: 32        # 숫자(따옴표 X)
-  lr: 3e-4              # 숫자(따옴표 X)
-  weight_decay: 1e-4    # 숫자(따옴표 X)
-  scheduler: cosine     # cosine | onecycle
-  early_stop_patience: 3
-  mix_precision: true
-  class_weight: balanced   # balanced | none
-  metric: f1_macro
+  epochs: 18
+  batch_size: 32
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  scheduler: cosine
+  early_stop_patience: 4
+  amp: true
+  label_smoothing: 0.05
+  mixup_alpha: 0.1
+  cutmix_alpha: 0.1
+  ema: true
+  num_workers: 0

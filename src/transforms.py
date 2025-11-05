@@ -1,40 +1,31 @@
-# src/transforms.py
-# 학습/추론은 항상 여기서만 transform을 가져가도록 통일(SSOT).
-try:
-    from .transforms_v3 import (
-        get_train_transforms_v3,
-        get_valid_transforms_v3,
-    )
+# src/transforms.py  (람다/경고 제거, partial 사용)
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from functools import partial
+from .preprocessing import _clahe_bgr, _deskew_hough, _letterbox, _reorient_and_deskew_inference
 
-# Explicitly expose stable names mapped to v3 implementations
-    def get_train_transforms(img_size=640):
-        return get_train_transforms_v3(img_size)
+def get_train_transforms(img_size=640):
+    return A.Compose([
+        A.Lambda(image=_deskew_hough, p=0.3),
+        A.Lambda(image=partial(_clahe_bgr, clip=1.5, grid=8), p=0.4),
+        A.ImageCompression(quality_range=(60,95), p=0.3),
+        A.RandomBrightnessContrast(p=0.3),
+        A.GaussNoise(var_limit=(5.0, 15.0), p=0.2),
+        A.Affine(scale=(0.95,1.05), rotate=(-8,8), shear=(-4,4),
+                 cval=255, mode=0, fit_output=False, p=0.35),
+        A.Perspective(scale=(0.02,0.05), p=0.2),
+        A.CoarseDropout(num_holes=2, max_height=int(0.08*img_size),
+                        max_width=int(0.08*img_size), fill_value=255, p=0.2),
+        A.Lambda(image=partial(_letterbox, size=img_size), p=1.0),
+        A.Normalize(mean=(0.5,0.5,0.5), std=(0.5,0.5,0.5)),
+        ToTensorV2()
+    ])
 
-    def get_valid_transforms(img_size=640):
-        return get_valid_transforms_v3(img_size)
-
-    # ensure names exist at module level even if transforms_v3 behaves oddly
-    globals()['get_train_transforms'] = get_train_transforms
-    globals()['get_valid_transforms'] = get_valid_transforms
-
-except ImportError:
-    # v3 파일이 없더라도 실패하지 않도록 최소 폴백 제공
-    import albumentations as A
-    from albumentations.pytorch import ToTensorV2
-    import cv2
-
-    def get_train_transforms(img_size=640):
-        return A.Compose([
-            A.LongestMaxSize(max_size=img_size),
-            A.PadIfNeeded(img_size, img_size, border_mode=cv2.BORDER_CONSTANT, value=255),
-            A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
-            ToTensorV2(),
-        ])
-
-    def get_valid_transforms(img_size=640):
-        return A.Compose([
-            A.LongestMaxSize(max_size=img_size),
-            A.PadIfNeeded(img_size, img_size, border_mode=cv2.BORDER_CONSTANT, value=255),
-            A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
-            ToTensorV2(),
-        ])
+def get_valid_transforms(img_size=640):
+    return A.Compose([
+        A.Lambda(image=_reorient_and_deskew_inference, p=1.0),
+        A.Lambda(image=partial(_clahe_bgr, clip=2.0, grid=8), p=1.0),
+        A.Lambda(image=partial(_letterbox, size=img_size), p=1.0),
+        A.Normalize(mean=(0.5,0.5,0.5), std=(0.5,0.5,0.5)),
+        ToTensorV2()
+    ])
