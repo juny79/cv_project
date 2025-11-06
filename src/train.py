@@ -1,219 +1,222 @@
-# src/train.py
-import os, yaml, random, timm, torch
+import os, yaml, timm, torch, random
 import numpy as np, pandas as pd
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import StratifiedKFold
+from sklearn.utils.class_weight import compute_class_weight
 from sklearn.metrics import f1_score
 from PIL import Image
-from src.preprocessing import get_train_transforms, get_valid_transforms
+from tqdm import tqdm
 
-# ---------------- utils ----------------
-def set_seed(s=42):
-    random.seed(s); np.random.seed(s); torch.manual_seed(s)
-    torch.cuda.manual_seed_all(s)
-    torch.backends.cudnn.deterministic = False
-    torch.backends.cudnn.benchmark = True
+from src.transforms import get_train_transforms, get_valid_transforms
 
-def load_cfg(p):
-    with open(p,'r') as f: return yaml.safe_load(f)
+def set_seed(seed=42):
+    os.environ['PYTHONHASHSEED']=str(seed)
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic=True
+    torch.backends.cudnn.benchmark=False
 
-class ImgDS(Dataset):
-    exts = ('.jpg','.jpeg','.png','.JPG','.PNG','.JPEG','')
-    def __init__(self, csv, img_dir, transform, has_label=True):
-        self.df = pd.read_csv(csv)
-        self.dir = img_dir
-        self.tf = transform
-        self.has_label = has_label
-        idc = [c for c in self.df.columns if 'id' in c.lower() or 'file' in c.lower()]
+def auto_device(name):
+    if name == 'auto':
+        return 'cuda' if torch.cuda.is_available() else 'cpu'
+    return name
+
+def load_cfg(path):
+    try:
+        with open(path,'r') as f:
+            cfg = yaml.safe_load(f)
+        if not isinstance(cfg, dict):
+            raise ValueError("Configuration must be a dictionary")
+        return cfg
+    except (yaml.YAMLError, OSError) as e:
+        raise RuntimeError(f"Failed to load config from {path}: {str(e)}")
+
+COMMON_EXTS = ('.jpg','.jpeg','.png','.JPG','.PNG','.JPEG','')
+
+def resolve_image_path(img_dir, stem):
+    s = str(stem)
+    for ext in COMMON_EXTS:
+        p = os.path.join(img_dir, s + ext)
+        if os.path.exists(p):
+            return p
+    p = os.path.join(img_dir, s)
+    if os.path.exists(p): return p
+    raise FileNotFoundError(f"image not found for {stem} under {img_dir}")
+
+class DocumentDataset(Dataset):
+    def __init__(self, df, img_dir, transform):
+        self.df = df.reset_index(drop=True)
+        self.img_dir = img_dir
+        self.transform = transform
+        idc = [c for c in self.df.columns if c.lower() in ['id','image_id','filename','image']]
         self.id_col = idc[0] if idc else self.df.columns[0]
-        if has_label:
-            lcs = [c for c in self.df.columns if c.lower() in ['target','label','class']]
-            self.y_col = lcs[0] if lcs else self.df.columns[-1]
+        ycs = [c for c in self.df.columns if c.lower() in ['label','target','class']]
+        self.y_col = ycs[0] if ycs else self.df.columns[-1]
+
     def __len__(self): return len(self.df)
     def __getitem__(self, i):
-        row = self.df.iloc[i]
-        stem = str(row[self.id_col])
-        img = None
-        for e in self.exts:
-            p = os.path.join(self.dir, stem+e)
-            if os.path.exists(p):
-                img = np.array(Image.open(p).convert('RGB')); break
-        if img is None:
-            raise FileNotFoundError(stem)
-        x = self.tf(image=img)['image']
-        y = int(row[self.y_col]) if self.has_label else -1
+        r = self.df.iloc[i]
+        p = resolve_image_path(self.img_dir, r[self.id_col])
+        img = np.array(Image.open(p).convert('RGB'))
+        x = self.transform(image=img)['image']
+        y = int(r[self.y_col])
         return x, y
 
-# ----------- EMA (optional) -----------
-class EMA:
-    def __init__(self, model, decay=0.999):
-        self.decay = decay
-        self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items()}
-    @torch.no_grad()
-    def update(self, model):
-        for k, v in model.state_dict().items():
-            if v.dtype.is_floating_point:
-                self.shadow[k].mul_(self.decay).add_(v, alpha=1-self.decay)
-    def apply_to(self, model):
-        model.load_state_dict(self.shadow, strict=False)
-
-# -------- Label smoothing CE ----------
-class SmoothCE(nn.Module):
-    def __init__(self, eps=0.05):
-        super().__init__(); self.eps = eps; self.ce = nn.CrossEntropyLoss()
-    def forward(self, logits, target):
-        if self.eps<=0: return self.ce(logits, target)
-        num_classes = logits.size(-1)
-        with torch.no_grad():
-            true_dist = torch.zeros_like(logits)
-            true_dist.fill_(self.eps / (num_classes - 1))
-            true_dist.scatter_(1, target.unsqueeze(1), 1 - self.eps)
-        logp = torch.log_softmax(logits, dim=1)
-        return -(true_dist * logp).sum(dim=1).mean()
-
-# -------- MixUp / CutMix (light) ------
-def do_mix(inputs, targets, alpha):
-    if alpha<=0: return inputs, targets, None
-    lam = np.random.beta(alpha, alpha)
-    idx = torch.randperm(inputs.size(0), device=inputs.device)
-    x = lam*inputs + (1-lam)*inputs[idx]
-    return x, (targets, targets[idx], lam), 'mixup'
-
-def do_cutmix(inputs, targets, alpha):
-    if alpha<=0: return inputs, targets, None
-    lam = np.random.beta(alpha, alpha)
-    B, C, H, W = inputs.size()
-    cx, cy = np.random.randint(W), np.random.randint(H)
-    w = int(W*np.sqrt(1-lam)); h = int(H*np.sqrt(1-lam))
-    x1, y1 = np.clip(cx-w//2, 0, W), np.clip(cy-h//2, 0, H)
-    x2, y2 = np.clip(cx+w//2, 0, W), np.clip(cy+h//2, 0, H)
-    idx = torch.randperm(B, device=inputs.device)
-    inputs[:, :, y1:y2, x1:x2] = inputs[idx, :, y1:y2, x1:x2]
-    lam2 = 1 - ((x2-x1)*(y2-y1)/(W*H))
-    return inputs, (targets, targets[idx], lam2), 'cutmix'
-
-def mix_loss(criterion, logits, mix_tgt):
-    y1, y2, lam = mix_tgt
-    return lam*criterion(logits, y1) + (1-lam)*criterion(logits, y2)
-
-# -------------- train/eval --------------
-def train_one_epoch(model, loader, opt, criterion, device, scaler=None,
-                    mixup=0.1, cutmix=0.1, ema: EMA|None=None):
+def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None, mixup_fn=None):
     model.train()
-    losses, preds, tgts = [], [], []
-    for xb, yb in loader:
-        xb, yb = xb.to(device), yb.to(device)
-        mix_tgt = None; kind = None
-        r = np.random.rand()
-        if r < cutmix: xb, mix_tgt, kind = do_cutmix(xb, yb, cutmix)
-        elif r < cutmix + mixup: xb, mix_tgt, kind = do_mix(xb, yb, mixup)
+    losses, preds_all, tgts_all = [], [], []
+    for xb, yb in tqdm(loader, leave=False):
+        xb = xb.to(device, non_blocking=True)
+        yb = yb.to(device, non_blocking=True)
 
-        opt.zero_grad(set_to_none=True)
-        with torch.cuda.amp.autocast(enabled=scaler is not None):
-            logits = model(xb)
-            if mix_tgt is None:
-                loss = criterion(logits, yb)
-            else:
-                loss = mix_loss(criterion, logits, mix_tgt)
-        if scaler:
-            scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+        if mixup_fn is not None:
+            xb, yb_mix = mixup_fn(xb, yb)
+            with torch.amp.autocast(device_type='cuda', enabled=(scaler is not None)):
+                logits = model(xb)
+                loss = criterion(logits, yb_mix)
         else:
-            loss.backward(); opt.step()
-        if ema: ema.update(model)
+            with torch.amp.autocast(device_type='cuda', enabled=(scaler is not None)):
+                logits = model(xb)
+                loss = criterion(logits, yb)
+
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+        else:
+            loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+        if scaler is not None:
+            scaler.step(optimizer); scaler.update()
+        else:
+            optimizer.step()
 
         losses.append(loss.item())
-        preds.extend(torch.argmax(logits,1).detach().cpu().tolist())
-        tgts.extend(yb.detach().cpu().tolist())
-    f1 = f1_score(tgts, preds, average='macro')
+        preds_all.extend(torch.argmax(logits, 1).detach().cpu().tolist())
+        tgts_all.extend(yb.detach().cpu().tolist())
+    f1 = f1_score(tgts_all, preds_all, average='macro')
     return float(np.mean(losses)), f1
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device):
+def valid_one_epoch(model, loader, criterion, device):
     model.eval()
-    losses, preds, tgts = [], [], []
-    for xb, yb in loader:
-        xb, yb = xb.to(device), yb.to(device)
+    losses, preds_all, tgts_all = [], [], []
+    for xb, yb in tqdm(loader, leave=False):
+        xb = xb.to(device, non_blocking=True)
+        yb = yb.to(device, non_blocking=True)
         logits = model(xb)
         loss = criterion(logits, yb)
         losses.append(loss.item())
-        preds.extend(torch.argmax(logits,1).cpu().tolist())
-        tgts.extend(yb.cpu().tolist())
-    f1 = f1_score(tgts, preds, average='macro')
+        preds_all.extend(torch.argmax(logits, 1).detach().cpu().tolist())
+        tgts_all.extend(yb.detach().cpu().tolist())
+    f1 = f1_score(tgts_all, preds_all, average='macro')
     return float(np.mean(losses)), f1
 
-# -------------- main --------------------
+class MixupWrapper:
+    def __init__(self, alpha=0.2, num_classes=17):
+        self.alpha = alpha
+        self.num_classes = num_classes
+    def __call__(self, x, y):
+        if self.alpha <= 0: return x, y
+        lam = np.random.beta(self.alpha, self.alpha)
+        idx = torch.randperm(x.size(0), device=x.device)
+        mixed_x = lam * x + (1 - lam) * x[idx, :]
+        y1 = torch.nn.functional.one_hot(y, num_classes=self.num_classes).float()
+        y2 = y1[idx]
+        return mixed_x, lam * y1 + (1 - lam) * y2
+
 def main():
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument('--config', required=True)
     args = ap.parse_args()
 
-    cfg = load_cfg(args.config); set_seed(cfg.get('seed',42))
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    cfg = load_cfg(args.config)
+    set_seed(cfg.get('seed',42))
+    device = auto_device(cfg.get('device','auto'))
 
-    paths, data, tr = cfg['paths'], cfg['data'], cfg['train']
-    img_size = int(data['img_size'])
+    paths = cfg['paths']; data = cfg['data']; trn = cfg['train']; model_cfg = cfg['model']
+    out_dir = paths.get('out_dir','./outputs'); os.makedirs(out_dir, exist_ok=True)
 
     df = pd.read_csv(paths['train_csv'])
-    ycol = [c for c in df.columns if c.lower() in ['target','label','class']]
+    ycol = [c for c in df.columns if c.lower() in ['label','target','class']]
     ycol = ycol[0] if ycol else df.columns[-1]
-    X = df.index.values; y = df[ycol].values
+    y = df[ycol].astype(int).values
+    num_classes = len(np.unique(y))
 
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=cfg.get('seed',42))
-    for fold, (tr_idx, va_idx) in enumerate(skf.split(X, y)):
-        print(f"\n========== Fold {fold} ==========")
-        tr_tf = get_train_transforms(img_size)
-        va_tf = get_valid_transforms(img_size)
-        tr_ds = ImgDS(paths['train_csv'], paths['train_dir'], tr_tf, True)
-        va_ds = ImgDS(paths['train_csv'], paths['train_dir'], va_tf, True)
-        tr_ds.df = tr_ds.df.iloc[tr_idx].reset_index(drop=True)
-        va_ds.df = va_ds.df.iloc[va_idx].reset_index(drop=True)
+    weights = None
+    if str(trn.get('class_weight','')).lower() == 'balanced':
+        cls_w = compute_class_weight(class_weight='balanced', classes=np.unique(y), y=y)
+        weights = torch.tensor(cls_w, dtype=torch.float32).to(device)
 
-        tr_loader = DataLoader(tr_ds, batch_size=tr['batch_size'], shuffle=True,
-                               num_workers=tr.get('num_workers',2), pin_memory=True)
-        va_loader = DataLoader(va_ds, batch_size=tr['batch_size'], shuffle=False,
-                               num_workers=tr.get('num_workers',2), pin_memory=True)
+    skf = StratifiedKFold(n_splits=data.get('n_splits',5), shuffle=True, random_state=cfg.get('seed',42))
 
-        model = timm.create_model(cfg['model']['name'],
-                                  pretrained=cfg['model'].get('pretrained', True),
-                                  num_classes=int(data['num_classes'])).to(device)
-        if cfg['model'].get('dropout'):
-            if hasattr(model, 'drop_rate'): model.drop_rate = cfg['model']['dropout']
+    for fold_id, (tr_idx, va_idx) in enumerate(skf.split(df, y)):
+        print(f"\n========== Fold {fold_id} ==========")
+        df_tr = df.iloc[tr_idx].reset_index(drop=True)
+        df_va = df.iloc[va_idx].reset_index(drop=True)
 
-        criterion = SmoothCE(eps=tr.get('label_smoothing',0.0)).to(device)
-        opt = torch.optim.AdamW(model.parameters(), lr=float(tr['lr']),
-                                weight_decay=float(tr['weight_decay']))
-        if tr['scheduler'] == 'cosine':
-            sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=tr['epochs'])
+        tr_tf = get_train_transforms(data['img_size'])
+        va_tf = get_valid_transforms(data['img_size'])
+
+        ds_tr = DocumentDataset(df_tr, paths['train_dir'], tr_tf)
+        ds_va = DocumentDataset(df_va, paths['train_dir'], va_tf)
+
+        num_workers = min(int(cfg.get('num_workers', 0)), os.cpu_count() or 1)
+        persistent_workers = num_workers > 0
+        dl_tr = DataLoader(ds_tr, batch_size=int(trn['batch_size']), shuffle=True,
+                          num_workers=num_workers, pin_memory=True, 
+                          persistent_workers=persistent_workers, drop_last=False)
+        dl_va = DataLoader(ds_va, batch_size=int(trn['batch_size']), shuffle=False,
+                          num_workers=num_workers, pin_memory=True,
+                          persistent_workers=persistent_workers)
+
+        model = timm.create_model(model_cfg['name'],
+                                  pretrained=bool(model_cfg.get('pretrained', True)),
+                                  num_classes=num_classes, drop_rate=float(model_cfg.get('dropout',0.0))).to(device)
+
+        mixup_fn = MixupWrapper(alpha=float(trn.get('mixup_alpha',0)), num_classes=num_classes) if trn.get('mixup_alpha',0) else None
+        criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=float(model_cfg.get('label_smoothing',0.0)))
+        optimizer = torch.optim.AdamW(model.parameters(), lr=float(trn['lr']), weight_decay=float(trn['weight_decay']))
+
+        sched_name = str(trn.get('scheduler','cosine')).lower()
+        if sched_name == 'cosine':
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=int(trn['epochs']))
+        elif sched_name == 'onecycle':
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=float(trn['lr']),
+                                                            epochs=int(trn['epochs']), steps_per_epoch=len(dl_tr))
         else:
-            sch = None
-        scaler = torch.cuda.amp.GradScaler(enabled=tr.get('amp', True))
-        ema = EMA(model) if tr.get('ema', True) else None
+            scheduler = None
 
-        best_f1, es_cnt = -1, 0
-        out_fold = os.path.join(paths['out_dir'], f'fold{fold}')
-        os.makedirs(out_fold, exist_ok=True)
+        use_amp = bool(trn.get('amp', True)) and torch.cuda.is_available()
+        scaler = torch.amp.GradScaler('cuda', enabled=use_amp) if use_amp else None
+        best_f1, bad = -1.0, 0
+        patience = int(trn.get('early_stop_patience',3))
 
-        for ep in range(1, tr['epochs']+1):
-            tl, tf1 = train_one_epoch(model, tr_loader, opt, criterion, device, scaler,
-                                      mixup=tr.get('mixup_alpha',0.0),
-                                      cutmix=tr.get('cutmix_alpha',0.0),
-                                      ema=ema)
-            if ema: ema.apply_to(model)
-            vl, vf1 = evaluate(model, va_loader, criterion, device)
-            if sch: sch.step()
+        for ep in range(1, int(trn['epochs'])+1):
+            tr_loss, tr_f1 = train_one_epoch(model, dl_tr, criterion, optimizer, device, scaler, mixup_fn)
+            va_loss, va_f1 = valid_one_epoch(model, dl_va, criterion, device)
+            if scheduler is not None and sched_name != 'onecycle':
+                scheduler.step()
 
-            print(f"[Fold {fold}] Ep {ep}/{tr['epochs']} | Train loss {tl:.4f} f1 {tf1:.4f} | Valid loss {vl:.4f} f1 {vf1:.4f}")
-            if vf1 > best_f1:
-                best_f1 = vf1; es_cnt = 0
-                torch.save({'model': model.state_dict()}, os.path.join(out_fold, 'best.pt'))
+            print(f"[Fold {fold_id}] Ep {ep}/{trn['epochs']} | Train loss {tr_loss:.4f} f1 {tr_f1:.4f} | "
+                  f"Valid loss {va_loss:.4f} f1 {va_f1:.4f}")
+
+            if va_f1 > best_f1:
+                best_f1, bad = va_f1, 0
+                fold_dir = os.path.join(out_dir, f'fold{fold_id}'); os.makedirs(fold_dir, exist_ok=True)
+                torch.save({'model': model.state_dict()}, os.path.join(fold_dir, 'best.pt'))
+                print(f"[Fold {fold_id}] ✓ Best updated (F1={best_f1:.4f})")
             else:
-                es_cnt += 1
-                if es_cnt >= tr['early_stop_patience']:
-                    print(f"[Fold {fold}] Early stop. Best F1={best_f1:.4f}")
+                bad += 1
+                if bad >= patience:
+                    print(f"[Fold {fold_id}] Early stop. Best F1={best_f1:.4f}")
                     break
-        print(f"[Fold {fold}] Best F1: {best_f1:.4f}")
+
+        print(f"[Fold {fold_id}] Best F1: {best_f1:.4f}")
 
 if __name__ == '__main__':
     main()

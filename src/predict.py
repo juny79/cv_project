@@ -1,95 +1,139 @@
-# src/predict.py
 import os, yaml, timm, torch
 import numpy as np, pandas as pd
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset, DataLoader
 from PIL import Image
-from src.preprocessing import get_valid_transforms
+from src.transforms import get_valid_transforms
 
-def load_cfg(p): 
-    with open(p,'r') as f: return yaml.safe_load(f)
+COMMON_EXTS = ('.jpg','.jpeg','.png','.JPG','.PNG','.JPEG','')
+
+def load_cfg(p):
+    try:
+        with open(p, 'r') as f:
+            cfg = yaml.safe_load(f)
+        if not isinstance(cfg, dict):
+            raise ValueError("Config must be a mapping/dictionary")
+        return cfg
+    except (OSError, yaml.YAMLError) as e:
+        raise RuntimeError(f"Failed to load config {p}: {e}")
+
+def resolve_image_path(img_dir, stem):
+    s = str(stem)
+    for ext in COMMON_EXTS:
+        p = os.path.join(img_dir, s + ext)
+        if os.path.exists(p): return p
+    p = os.path.join(img_dir, s)
+    if os.path.exists(p): return p
+    raise FileNotFoundError(f"image not found for {stem} under {img_dir}")
 
 class TestDS(Dataset):
-    exts = ('.jpg','.jpeg','.png','.JPG','.PNG','.JPEG','')
-    def __init__(self, csv, img_dir, tf):
-        self.df = pd.read_csv(csv); self.dir = img_dir; self.tf = tf
-        idc = [c for c in self.df.columns if 'id' in c.lower() or 'file' in c.lower()]
+    def __init__(self, csv, img_dir, transform):
+        self.df = pd.read_csv(csv)
+        self.img_dir = img_dir
+        self.transform = transform
+        idc = [c for c in self.df.columns if c.lower() in ['id','image_id','filename']]
         self.id_col = idc[0] if idc else self.df.columns[0]
     def __len__(self): return len(self.df)
     def __getitem__(self, i):
         stem = str(self.df.iloc[i][self.id_col])
-        img = None
-        for e in self.exts:
-            p = os.path.join(self.dir, stem+e)
-            if os.path.exists(p):
-                img = np.array(Image.open(p).convert('RGB')); break
-        if img is None: raise FileNotFoundError(stem)
-        return self.tf(image=img)['image'], stem
-
-def _tta_logits(model, xb):
-    outs = []
-    outs.append(model(xb))                             # 0°
-    outs.append(model(torch.flip(xb, dims=[3])))       # hflip
-    for k in [1,2,3]:                                  # 90/180/270
-        outs.append(model(torch.rot90(xb, k=k, dims=(2,3))))
-    return torch.stack(outs).mean(0)
+        p = resolve_image_path(self.img_dir, stem)
+        img = np.array(Image.open(p).convert('RGB'))
+        x = self.transform(image=img)['image']
+        return x, stem
 
 @torch.no_grad()
-def main():
-    import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--config', required=True)
-    args = ap.parse_args()
-
-    cfg = load_cfg(args.config)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+def predict_ensemble(cfg_path, tta=4):
+    cfg = load_cfg(cfg_path)
     paths, data = cfg['paths'], cfg['data']
-    img_size = int(data['img_size'])
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    tfm = get_valid_transforms(int(data['img_size']))
 
-    tf = get_valid_transforms(img_size)
-    ds = TestDS(paths['sample_csv'], paths['test_dir'], tf)
-    loader = DataLoader(ds, batch_size=int(cfg['train']['batch_size']),
-                        shuffle=False, num_workers=2, pin_memory=True)
+    test = TestDS(paths['sample_csv'], paths['test_dir'], tfm)
+    num_workers = min(int(cfg.get('num_workers', 0)), os.cpu_count() or 1)
+    pin_memory = True if device.startswith('cuda') else False
+    loader = DataLoader(test, batch_size=int(cfg['train']['batch_size']), shuffle=False,
+                        num_workers=num_workers, pin_memory=pin_memory)
 
-    # fold checkpoints
-    folds = data.get('folds', [0,1,2,3,4])
-    ckpts = []
+    ckpts, folds = [], data.get('folds', [0,1,2,3,4])
     for k in folds:
         p = os.path.join(paths['out_dir'], f'fold{k}', 'best.pt')
         if os.path.exists(p): ckpts.append(p)
-    assert ckpts, "no checkpoints found"
+    if not ckpts:
+        raise FileNotFoundError(f"No checkpoints found under {paths['out_dir']}/fold*/best.pt")
 
-    # infer num_classes
     state0 = torch.load(ckpts[0], map_location='cpu', weights_only=False)
+    # num_classes 추정
     num_classes = None
     for k,v in state0['model'].items():
-        if v.ndim==2 and k.endswith('weight'): num_classes = v.shape[0]; break
-    assert num_classes is not None
+        if k.endswith('weight') and hasattr(v,'shape') and len(v.shape)==2:
+            num_classes = v.shape[0]; break
+    if num_classes is None:
+        raise RuntimeError("cannot infer num_classes from checkpoint")
 
-    model = timm.create_model(cfg['model']['name'], pretrained=False,
-                              num_classes=num_classes).to(device)
+    model = timm.create_model(cfg['model']['name'], pretrained=False, num_classes=num_classes).to(device)
     model.eval()
 
-    all_logits = []
+    def _four_rot_logits(xb):
+        outs = []
+        outs.append(model(xb))                                        # 0
+        outs.append(model(torch.rot90(xb, 1, dims=[2,3])))            # 90
+        outs.append(model(torch.rot90(xb, 2, dims=[2,3])))            # 180
+        outs.append(model(torch.rot90(xb, 3, dims=[2,3])))            # 270
+        return outs
+
+    logits_folds = None
     for ck in ckpts:
         w = torch.load(ck, map_location=device, weights_only=False)
         model.load_state_dict(w['model'], strict=False)
-        fold_logits = []
-        for xb, _ in loader:
+        model.eval()
+
+        selected_logits = []
+        for xb, _ids in loader:
             xb = xb.to(device)
-            logits = _tta_logits(model, xb)           # TTA 적용
-            fold_logits.append(logits.detach().cpu())
-        all_logits.append(torch.cat(fold_logits))
-    mean_logits = torch.stack(all_logits).mean(0)
+            if int(tta) == 0 or int(tta) == 1:
+                # no rotation TTA: single forward
+                out = model(xb)
+                selected_logits.append(out.detach().cpu())
+                continue
+
+            # default/4: rotation-based TTA
+            cand = _four_rot_logits(xb)  # list of 4 tensors [B,C]
+            probs = [torch.softmax(z, dim=1) for z in cand]
+            maxp = torch.stack([p.max(dim=1).values for p in probs], dim=0)  # [4,B]
+            best_idx = torch.argmax(maxp, dim=0)                              # [B]
+            # pick best rotation per sample
+            pick = torch.stack([cand[r][i] for i, r in enumerate(best_idx.tolist())], dim=0)  # [B,C]
+            selected_logits.append(pick.detach().cpu())
+
+        fold_logits = torch.cat(selected_logits)
+
+        if logits_folds is None:
+            logits_folds = [fold_logits]
+        else:
+            logits_folds.append(fold_logits)
+
+    mean_logits = torch.stack(logits_folds).mean(0)
     preds = torch.argmax(mean_logits, 1).numpy()
 
-    sub = pd.read_csv(paths['sample_csv']).copy()
-    ycol = [c for c in sub.columns if c.lower() in ['target','label','class']]
-    ycol = ycol[0] if ycol else sub.columns[-1]
-    sub[ycol] = preds
+    sub = pd.read_csv(paths['sample_csv'])
+    idc = [c for c in sub.columns if c.lower() in ['id','image_id','filename']]
+    ycol = [c for c in sub.columns if c.lower() in ['label','target','class']]
+    id_col = idc[0] if idc else sub.columns[0]
+    y_col = ycol[0] if ycol else sub.columns[-1]
+
+    if len(sub) != len(preds):
+        raise ValueError(f"sample rows {len(sub)} != preds {len(preds)}")
+
+    sub[y_col] = preds
+    sub = sub[[id_col, y_col]]   # 포맷 강제
     out_csv = os.path.join(paths['out_dir'], 'submission.csv')
     os.makedirs(paths['out_dir'], exist_ok=True)
-    sub[['ID', ycol]].to_csv(out_csv, index=False)     # ID,target만 저장
-    print(f"Saved -> {out_csv}")
+    sub.to_csv(out_csv, index=False)
+    print(f"Saved → {out_csv}")
 
 if __name__ == '__main__':
-    main()
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--config', required=True)
+    ap.add_argument('--tta', type=int, default=4, help='TTA mode: 0 or 1 = no TTA, 4 = rotation TTA')
+    args = ap.parse_args()
+    predict_ensemble(args.config, tta=args.tta)

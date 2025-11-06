@@ -29,6 +29,10 @@ data/test/
 data/**/*
 !data/.gitkeep
 !data/README.md
+backup_v1/
+backup_v2/
+backup_v3/
+mlruns/
 
 # Outputs
 outputs/
