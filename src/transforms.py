@@ -91,7 +91,9 @@ def get_train_transforms(img_size):
 
         A.OneOf([
             A.Blur(blur_limit=(3,7), p=1.0),
-            A.GaussNoise(var_limit=(10,50), p=1.0),
+            # Albumentations GaussNoise now expects normalized std_range (fraction of max value)
+            # previous code used var_limit=(10,50) (variance on 0-255 scale). Map to std_range ~ sqrt(var/255).
+            A.GaussNoise(std_range=(0.20, 0.44), p=1.0),
             A.ISONoise(p=1.0),
         ], p=0.35),
 

@@ -62,12 +62,14 @@ def predict_ensemble(cfg_path, tta=4):
 
     state0 = torch.load(ckpts[0], map_location='cpu', weights_only=False)
     # num_classes 추정
-    num_classes = None
+    head_weight = None
     for k,v in state0['model'].items():
-        if k.endswith('weight') and hasattr(v,'shape') and len(v.shape)==2:
-            num_classes = v.shape[0]; break
-    if num_classes is None:
-        raise RuntimeError("cannot infer num_classes from checkpoint")
+        if 'head.fc.weight' in k and hasattr(v,'shape'):
+            head_weight = v
+            break
+    if head_weight is None:
+        raise RuntimeError("cannot find head.fc.weight in checkpoint")
+    num_classes = head_weight.shape[0]
 
     model = timm.create_model(cfg['model']['name'], pretrained=False, num_classes=num_classes).to(device)
     model.eval()
@@ -83,12 +85,19 @@ def predict_ensemble(cfg_path, tta=4):
     logits_folds = None
     for ck in ckpts:
         w = torch.load(ck, map_location=device, weights_only=False)
-        model.load_state_dict(w['model'], strict=False)
+        try:
+            model.load_state_dict(w['model'], strict=True)
+        except RuntimeError as e:
+            print(f"Warning: Failed to load checkpoint {ck} with strict=True: {e}")
+            print("Attempting to load with strict=False...")
+            model.load_state_dict(w['model'], strict=False)
         model.eval()
 
         selected_logits = []
+        img_ids = []  # Store image IDs for later
         for xb, _ids in loader:
             xb = xb.to(device)
+            img_ids.extend(_ids)
             if int(tta) == 0 or int(tta) == 1:
                 # no rotation TTA: single forward
                 out = model(xb)
@@ -125,10 +134,20 @@ def predict_ensemble(cfg_path, tta=4):
 
     sub[y_col] = preds
     sub = sub[[id_col, y_col]]   # 포맷 강제
+    # Save predictions
     out_csv = os.path.join(paths['out_dir'], 'submission.csv')
     os.makedirs(paths['out_dir'], exist_ok=True)
     sub.to_csv(out_csv, index=False)
     print(f"Saved → {out_csv}")
+    
+    # Save logits and image IDs for analysis
+    logits_path = os.path.join(paths['out_dir'], 'predict_logits.pt')
+    torch.save({
+        'logits': mean_logits.numpy(),
+        'img_ids': img_ids,
+        'predictions': preds,
+    }, logits_path)
+    print(f"Saved logits → {logits_path}")
 
 if __name__ == '__main__':
     import argparse

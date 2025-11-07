@@ -63,6 +63,23 @@ class DocumentDataset(Dataset):
         y = int(r[self.y_col])
         return x, y
 
+
+class RepeatAugDataset(Dataset):
+    """Wrap a base dataset and repeat indices so that each epoch yields
+    `multiplier * len(base)` samples. Each repeated access will call the
+    underlying dataset which applies stochastic transforms, producing
+    augmented variants of the same images.
+
+    Use-case: expand 1,570 -> 6,280 by setting multiplier=4.
+    """
+    def __init__(self, base_ds: Dataset, multiplier: int = 1):
+        self.base = base_ds
+        self.multiplier = max(1, int(multiplier))
+    def __len__(self):
+        return len(self.base) * self.multiplier
+    def __getitem__(self, idx):
+        return self.base[idx % len(self.base)]
+
 def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None, mixup_fn=None):
     model.train()
     losses, preds_all, tgts_all = [], [], []
@@ -164,6 +181,15 @@ def main():
 
         ds_tr = DocumentDataset(df_tr, paths['train_dir'], tr_tf)
         ds_va = DocumentDataset(df_va, paths['train_dir'], va_tf)
+
+        # Optional repeat-augmentation: increase effective training samples by
+        # repeating dataset indices so stochastic transforms produce different
+        # augmented variants each time. Controlled via `data.aug_multiplier`.
+        aug_mult = int(data.get('aug_multiplier', 1))
+        if aug_mult > 1:
+            print(f"Repeat-augmentation enabled: multiplier={aug_mult} -> "
+                  f"train samples {len(ds_tr)} -> {len(ds_tr) * aug_mult}")
+            ds_tr = RepeatAugDataset(ds_tr, multiplier=aug_mult)
 
         num_workers = min(int(cfg.get('num_workers', 0)), os.cpu_count() or 1)
         persistent_workers = num_workers > 0
