@@ -1,9 +1,0 @@
-
-# overrides for ResNet34
-MODEL:
-  NAME: resnet34
-  IMG_SIZE: 224
-TRAIN:
-  EPOCHS: 15
-OUT:
-  DIR: outputs/resnet34_224
