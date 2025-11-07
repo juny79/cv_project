@@ -15,6 +15,7 @@ data:
   folds: [0,1,2,3,4]
   n_splits: 5
   tta: 1               # predict.py는 회전선택(TTA) 내장, 여기 값은 사용 안 함
+  aug_multiplier: 4    # repeat-augmentation multiplier for training (1 = off)
 
 model:
   name: convnext_tiny.fb_in22k_ft_in1k   # timm 프리트레인 가중치 확실, 안정적

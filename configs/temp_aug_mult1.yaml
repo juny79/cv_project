@@ -1,0 +1,41 @@
+data:
+  aug_multiplier: 1
+  folds:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  img_size: 640
+  n_splits: 3
+  tta: 1
+device: auto
+log:
+  use_mlflow: false
+  use_wandb: false
+model:
+  dropout: 0.1
+  label_smoothing: 0.05
+  name: convnext_tiny.fb_in22k_ft_in1k
+  pretrained: true
+num_workers: 0
+paths:
+  base_dir: /root/cv_project/data
+  out_dir: outputs/aug_exp/mult1
+  sample_csv: /root/cv_project/data/sample_submission.csv
+  test_dir: /root/cv_project/data/test
+  train_csv: /root/cv_project/data/train.csv
+  train_dir: /root/cv_project/data/train
+seed: 42
+train:
+  amp: true
+  batch_size: 32
+  class_weight: balanced
+  cutmix_alpha: 0.0
+  early_stop_patience: 3
+  epochs: 3
+  grad_clip: 1.0
+  lr: 3e-4
+  mixup_alpha: 0.2
+  scheduler: cosine
+  weight_decay: 1e-4

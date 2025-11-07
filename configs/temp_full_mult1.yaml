@@ -1,0 +1,41 @@
+seed: 42
+device: auto
+num_workers: 0
+
+paths:
+  base_dir: /root/cv_project/data
+  train_csv: /root/cv_project/data/train.csv
+  sample_csv: /root/cv_project/data/sample_submission.csv
+  train_dir: /root/cv_project/data/train
+  test_dir: /root/cv_project/data/test
+  out_dir: /root/cv_project/outputs/full_mult1
+
+data:
+  img_size: 640
+  folds: [0,1,2,3,4]
+  n_splits: 5
+  tta: 1
+  aug_multiplier: 1
+
+model:
+  name: convnext_tiny.fb_in22k_ft_in1k
+  pretrained: true
+  dropout: 0.1
+  label_smoothing: 0.05
+
+train:
+  epochs: 12
+  batch_size: 32
+  lr: 3e-4
+  weight_decay: 1e-4
+  scheduler: cosine
+  early_stop_patience: 3
+  amp: true
+  mixup_alpha: 0.2
+  cutmix_alpha: 0.0
+  grad_clip: 1.0
+  class_weight: balanced
+
+log:
+  use_wandb: false
+  use_mlflow: false
