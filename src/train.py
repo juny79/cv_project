@@ -80,10 +80,14 @@ class RepeatAugDataset(Dataset):
     def __getitem__(self, idx):
         return self.base[idx % len(self.base)]
 
-def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None, mixup_fn=None):
+def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None, mixup_fn=None, batch_print_interval=20):
+    """Train for one epoch.
+    Added lightweight batch progress logging (every `batch_print_interval` batches) to
+    help debug perceived stalls when stdout is redirected (tqdm may not flush).
+    """
     model.train()
     losses, preds_all, tgts_all = [], [], []
-    for xb, yb in tqdm(loader, leave=False):
+    for bi, (xb, yb) in enumerate(tqdm(loader, leave=False)):
         xb = xb.to(device, non_blocking=True)
         yb = yb.to(device, non_blocking=True)
 
@@ -114,6 +118,9 @@ def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None, mi
         losses.append(loss.item())
         preds_all.extend(torch.argmax(logits, 1).detach().cpu().tolist())
         tgts_all.extend(yb.detach().cpu().tolist())
+
+        if batch_print_interval and bi % batch_print_interval == 0:
+            print(f"[Train] Batch {bi}/{len(loader)} loss={losses[-1]:.4f}")
     f1 = f1_score(tgts_all, preds_all, average='macro')
     return float(np.mean(losses)), f1
 
@@ -167,10 +174,22 @@ def main():
     weights = None
     if str(trn.get('class_weight','')).lower() == 'balanced':
         cls_w = compute_class_weight(class_weight='balanced', classes=np.unique(y), y=y)
+        # Optional: apply per-class weight boosts from config, e.g., {'3':1.2,'7':1.15}
+        boosts = cfg.get('class_weight_boost', {}) or {}
+        # accept int keys as well
+        for k, mul in boosts.items():
+            try:
+                idx = int(k)
+                if 0 <= idx < len(cls_w):
+                    cls_w[idx] *= float(mul)
+            except Exception:
+                continue
         weights = torch.tensor(cls_w, dtype=torch.float32).to(device)
 
     skf = StratifiedKFold(n_splits=data.get('n_splits',5), shuffle=True, random_state=cfg.get('seed',42))
 
+    # 실험 로그 저장용 리스트
+    log_rows = []
     for fold_id, (tr_idx, va_idx) in enumerate(skf.split(df, y)):
         print(f"\n========== Fold {fold_id} ==========")
         df_tr = df.iloc[tr_idx].reset_index(drop=True)
@@ -182,9 +201,6 @@ def main():
         ds_tr = DocumentDataset(df_tr, paths['train_dir'], tr_tf)
         ds_va = DocumentDataset(df_va, paths['train_dir'], va_tf)
 
-        # Optional repeat-augmentation: increase effective training samples by
-        # repeating dataset indices so stochastic transforms produce different
-        # augmented variants each time. Controlled via `data.aug_multiplier`.
         aug_mult = int(data.get('aug_multiplier', 1))
         if aug_mult > 1:
             print(f"Repeat-augmentation enabled: multiplier={aug_mult} -> "
@@ -223,13 +239,25 @@ def main():
         patience = int(trn.get('early_stop_patience',3))
 
         for ep in range(1, int(trn['epochs'])+1):
-            tr_loss, tr_f1 = train_one_epoch(model, dl_tr, criterion, optimizer, device, scaler, mixup_fn)
+            tr_loss, tr_f1 = train_one_epoch(model, dl_tr, criterion, optimizer, device, scaler, mixup_fn,
+                                             batch_print_interval=int(cfg.get('batch_print_interval', 20)))
             va_loss, va_f1 = valid_one_epoch(model, dl_va, criterion, device)
             if scheduler is not None and sched_name != 'onecycle':
                 scheduler.step()
 
             print(f"[Fold {fold_id}] Ep {ep}/{trn['epochs']} | Train loss {tr_loss:.4f} f1 {tr_f1:.4f} | "
                   f"Valid loss {va_loss:.4f} f1 {va_f1:.4f}")
+
+            # 로그 저장
+            log_rows.append({
+                'fold': fold_id,
+                'epoch': ep,
+                'train_loss': tr_loss,
+                'train_f1': tr_f1,
+                'valid_loss': va_loss,
+                'valid_f1': va_f1,
+                'best_f1': max(best_f1, va_f1),
+            })
 
             if va_f1 > best_f1:
                 best_f1, bad = va_f1, 0
@@ -243,6 +271,52 @@ def main():
                     break
 
         print(f"[Fold {fold_id}] Best F1: {best_f1:.4f}")
+
+        # ====================== Temperature Scaling & OOF Collection ======================
+        # Helper: collect raw logits over validation loader
+        @torch.no_grad()
+        def collect_logits(eval_model, loader, device):
+            eval_model.eval()
+            all_logits, all_tgts = [], []
+            for xb, yb in loader:
+                xb = xb.to(device, non_blocking=True)
+                lg = eval_model(xb).detach().cpu().numpy()
+                all_logits.append(lg)
+                all_tgts.append(yb.numpy())
+            return np.concatenate(all_logits, 0), np.concatenate(all_tgts, 0)
+
+        # Simple temperature fitting minimizing NLL (cross-entropy)
+        def fit_temperature(logits, labels, init_T=1.0, lr=0.01, iters=200):
+            import torch, torch.nn.functional as F
+            x = torch.tensor(logits, dtype=torch.float32)
+            y = torch.tensor(labels, dtype=torch.long)
+            T = torch.tensor([init_T], dtype=torch.float32, requires_grad=True)
+            opt = torch.optim.LBFGS([T], lr=lr, max_iter=iters)
+
+            def closure():
+                opt.zero_grad()
+                z = x / T.clamp_min(1e-4)
+                loss = F.cross_entropy(z, y)
+                loss.backward()
+                return loss
+            opt.step(closure)
+            return float(T.detach().clamp(0.3, 5.0).item())
+
+        eval_model = model  # If EMA used in future: eval_model = ema.ema.module
+        va_logits, va_tgts = collect_logits(eval_model, dl_va, device)
+        T = fit_temperature(va_logits, va_tgts)
+        fold_dir = os.path.join(out_dir, f'fold{fold_id}')
+        os.makedirs(fold_dir, exist_ok=True)
+        np.save(os.path.join(fold_dir, 'temp.npy'), np.array([T], dtype=np.float32))
+        np.savez_compressed(os.path.join(fold_dir, f'oof_fold{fold_id}.npz'), logits=va_logits, labels=va_tgts)
+        print(f"[Fold {fold_id}] saved temperature T={T:.3f} and OOF logits.")
+        # =============================================================================
+
+    # 모든 fold/epoch 로그를 CSV로 저장
+    log_df = pd.DataFrame(log_rows)
+    log_csv = os.path.join(out_dir, 'train_log.csv')
+    log_df.to_csv(log_csv, index=False)
+    print(f"[LOG] Saved training log to {log_csv}")
 
 if __name__ == '__main__':
     main()

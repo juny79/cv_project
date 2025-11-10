@@ -122,3 +122,70 @@ def get_valid_transforms(img_size):
         A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         ToTensorV2(),
     ])
+
+def _gamma(img, gamma=1.0):
+    if gamma is None or abs(gamma-1.0) < 1e-3:
+        return img
+    # Apply simple gamma correction assuming input uint8
+    inv = 1.0 / max(gamma, 1e-6)
+    lut = (np.linspace(0,1,256) ** inv) * 255.0
+    lut = np.clip(lut, 0, 255).astype(np.uint8)
+    return cv2.LUT(img, lut)
+
+def build_valid_transform(img_size, clahe_clip=1.9, unsharp_amount=0.5, deskew=True, gamma=1.0):
+    """Build a single deterministic test-time preprocessing pipeline based on parameters.
+
+    Parameters
+    ----------
+    img_size : int
+        Target square size for letterboxing.
+    clahe_clip : float
+        CLAHE clip limit.
+    unsharp_amount : float
+        Strength of unsharp mask (0 disables sharpening).
+    deskew : bool
+        Whether to apply deskew minAreaRect correction.
+    gamma : float
+        Gamma correction factor (>1 brighter mid-tones, <1 darker).
+    """
+    def _clahe_wrapper(img, **params):
+        return _clahe_bgr(img, clip=clahe_clip, grid=8)
+    def _unsharp_wrapper(img, **params):
+        return _unsharp(img, amount=unsharp_amount) if unsharp_amount > 0 else img
+    def _deskew_wrapper(img, **params):
+        return _deskew_minarea(img) if deskew else img
+    def _gamma_wrapper(img, **params):
+        return _gamma(img, gamma=gamma)
+
+    return A.Compose([
+        Letterbox(img_size, always_apply=True, p=1.0),
+        A.Lambda(name="_deskew", image=_deskew_wrapper, p=1.0),
+        A.Lambda(name="_clahe", image=_clahe_wrapper, p=1.0),
+        A.Lambda(name="_unsharp", image=_unsharp_wrapper, p=1.0),
+        A.Lambda(name="_gamma", image=_gamma_wrapper, p=1.0),
+        A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ToTensorV2(),
+    ])
+
+def get_valid_transform_variants(img_size, variant_specs):
+    """Return a list of (name, transform) tuples for variant test-time preprocessing.
+
+    variant_specs: list of dicts, each may contain keys:
+        - clahe_clip
+        - unsharp_amount
+        - deskew (bool)
+        - gamma
+        - name (optional label for logging)
+    """
+    variants = []
+    for i, spec in enumerate(variant_specs):
+        name = spec.get('name', f'v{i}')
+        t = build_valid_transform(
+            img_size,
+            clahe_clip=spec.get('clahe_clip', 1.9),
+            unsharp_amount=spec.get('unsharp_amount', 0.5),
+            deskew=spec.get('deskew', True),
+            gamma=spec.get('gamma', 1.0)
+        )
+        variants.append((name, t))
+    return variants

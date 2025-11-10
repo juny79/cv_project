@@ -1,0 +1,88 @@
+seed: 42
+device: auto
+num_workers: 0
+
+paths:
+  base_dir: /root/cv_project/data
+  train_csv: /root/cv_project/data/train.csv
+  sample_csv: /root/cv_project/data/sample_submission.csv
+  train_dir: /root/cv_project/data/train
+  test_dir: /root/cv_project/data/test
+  out_dir: /root/cv_project/outputs/full_mult4_with_routing
+
+data:
+  img_size: 640
+  folds: [0,1,2,3,4]
+  n_splits: 5
+  tta: 4
+  aug_multiplier: 4
+
+model:
+  name: convnext_tiny.fb_in22k_ft_in1k
+  pretrained: true
+  dropout: 0.1
+  label_smoothing: 0.05
+
+train:
+  epochs: 12
+  batch_size: 32
+  lr: 3e-4
+  weight_decay: 1e-4
+  scheduler: cosine
+  early_stop_patience: 3
+  amp: true
+  mixup_alpha: 0.2
+  cutmix_alpha: 0.0
+  grad_clip: 1.0
+  class_weight: balanced
+
+log:
+  use_wandb: false
+  use_mlflow: false
+
+inference:
+  amp: true
+  batch_size: 32
+  preproc_variants:
+    enable: true
+    combine: mean
+    variants:
+      - { name: base, clahe_clip: 1.9, unsharp_amount: 0.5, deskew: true,  gamma: 1.00 }
+      - { name: mild, clahe_clip: 1.6, unsharp_amount: 0.3, deskew: true,  gamma: 0.95 }
+      - { name: strong, clahe_clip: 2.2, unsharp_amount: 0.7, deskew: true,  gamma: 1.05 }
+
+ensemble:
+  easy_classes: [0,2,5,8,9,15,16]
+  easy_conf: 0.92
+  easy_conf_map: { "0":0.90, "2":0.92, "5":0.92, "8":0.92, "9":0.90, "15":0.92, "16":0.92 }
+
+meta_gate:
+  entropy_thr: 1.4
+  margin_thr: 0.10
+
+text_gate:
+  enable: true
+  pairs: [[3,7], [4,14]]
+  delta_thr: 0.08
+  conf_thr: 0.35
+  prefer_higher: true
+
+pair_gate:
+  enable: true
+  pairs: [[3,7], [4,14]]
+  delta_thr: 0.05
+  conf_thr: 0.55
+  entropy_thr: 1.2
+  margin_thr: 0.12
+
+text_routing:
+  enable: true
+  source: /root/cv_project/extern/ocr_text.csv
+  pairs: [[3,7], [4,14]]
+  delta_thr: 0.04
+  conf_thr: 0.55
+  min_hits: 2
+  prefer_top: true
+  debug:
+    enable: true
+    csv_path: /root/cv_project/outputs/full_mult4_with_routing/keyword_routing_debug.csv
