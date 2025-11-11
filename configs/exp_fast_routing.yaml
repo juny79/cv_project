@@ -5,17 +5,16 @@ num_workers: 0
 paths:
   base_dir: /root/cv_project/data
   train_csv: /root/cv_project/data/train.csv
-  sample_csv: /root/cv_project/data/sample_submission.csv
+  sample_csv: /root/cv_project/data/sample_submission_subset.csv
   train_dir: /root/cv_project/data/train
   test_dir: /root/cv_project/data/test
-  # Use existing checkpoints under full_mult4; we'll copy results out after run
   out_dir: /root/cv_project/outputs/full_mult4
 
 data:
   img_size: 640
-  folds: [0,1,2,3,4]
+  folds: [0]             # single fold for speed
   n_splits: 5
-  tta: 4
+  tta: 0                 # we'll override via CLI too
   aug_multiplier: 4
 
 model:
@@ -26,7 +25,7 @@ model:
 
 train:
   epochs: 12
-  batch_size: 32
+  batch_size: 16
   lr: 3e-4
   weight_decay: 1e-4
   scheduler: cosine
@@ -43,14 +42,9 @@ log:
 
 inference:
   amp: true
-  batch_size: 32
+  batch_size: 16
   preproc_variants:
-    enable: true
-    combine: mean
-    variants:
-      - { name: base, clahe_clip: 1.9, unsharp_amount: 0.5, deskew: true,  gamma: 1.00 }
-      - { name: mild, clahe_clip: 1.6, unsharp_amount: 0.3, deskew: true,  gamma: 0.95 }
-      - { name: strong, clahe_clip: 2.2, unsharp_amount: 0.7, deskew: true,  gamma: 1.05 }
+    enable: false        # disable variants for speed
 
 ensemble:
   easy_classes: [0,1,2,5,6,8,9,15,16]
@@ -64,8 +58,8 @@ meta_gate:
 text_gate:
   enable: true
   pairs: [[3,7], [4,14]]
-  delta_thr: 0.08
-  conf_thr: 0.35
+  delta_thr: 0.10
+  conf_thr: 0.40
   prefer_higher: true
 
 pair_gate:
@@ -77,10 +71,22 @@ pair_gate:
   margin_thr: 0.12
 
 text_routing:
-  enable: false
-  source: /root/cv_project/extern/ocr_text.csv
+  enable: true
+  source: "/root/cv_project/extern/ocr_text.csv"
   pairs: [[3,7], [4,14]]
-  delta_thr: 0.04
-  conf_thr: 0.55
-  min_hits: 2
+  delta_thr: 0.12
+  conf_thr: 0.50
+  min_hits: 1
+  min_hits_wide: 2
   prefer_top: true
+  normalization:
+    to_lower: true
+    remove_spaces: false
+    remove_punct: true
+    remove_digits: true
+    nfkc: true
+    keep_hyphens: true
+    collapse_repeats: true
+  debug:
+    enable: true
+    csv_path: /root/cv_project/outputs/fast_routing/keyword_routing_debug.csv

@@ -49,77 +49,115 @@ class TestDS(Dataset):
         return x, stem
 
 def _normalize_text(s, opts=None):
-    """Normalize text for keyword matching.
-    opts: {
-      to_lower: bool, remove_spaces: bool, remove_punct: bool,
-      remove_digits: bool, nfkc: bool
-    }
+    """Normalize text for keyword matching with richer handling.
+    opts keys (all optional):
+      to_lower, remove_spaces, remove_punct, remove_digits, nfkc,
+      keep_hyphens, collapse_repeats.
+    - Hyphen variants (－–—﹣−) unified to '-'.
+    - If keep_hyphens True, hyphen retained; else removed with other punct.
+    - collapse_repeats collapses 3+ repeated characters (OCR noise like '확인서서서').
     """
     if not s or not isinstance(s, str):
         return ''
     if opts is None:
         opts = {}
-    # Defaults tuned for noisy OCR
     to_lower = bool(opts.get('to_lower', True))
     remove_spaces = bool(opts.get('remove_spaces', True))
     remove_punct = bool(opts.get('remove_punct', True))
     remove_digits = bool(opts.get('remove_digits', True))
     use_nfkc = bool(opts.get('nfkc', True))
+    keep_hyphens = bool(opts.get('keep_hyphens', True))
+    collapse_repeats = bool(opts.get('collapse_repeats', True))
 
     if use_nfkc:
         s = unicodedata.normalize('NFKC', s)
+    # unify dash variants BEFORE lower
+    s = re.sub(r'[\-‐‑‒–—﹣−]', '-', s)
     if to_lower:
         s = s.lower()
     if remove_spaces:
         s = re.sub(r'\s+', '', s)
     if remove_punct:
-        # Remove common punctuation and symbols while preserving Korean/English letters
-        s = re.sub(r'[^0-9a-zA-Z가-힣]+', '', s)
+        if keep_hyphens:
+            # keep hyphen but remove other punctuation
+            s = re.sub(r'[^0-9a-zA-Z가-힣\-]+', '', s)
+        else:
+            s = re.sub(r'[^0-9a-zA-Z가-힣]+', '', s)
     if remove_digits:
         s = re.sub(r'\d+', '', s)
+    if collapse_repeats:
+        # Collapse 3+ repeats of a single char (helps with OCR duplication noise)
+        s = re.sub(r'(.)\1{2,}', r'\1', s)
     return s
 
-# Keyword patterns for OCR-based routing
+# Keyword patterns for OCR-based routing (core + wide groups)
+# wide: document title & extended phrases; require higher min_hits_wide.
 KEYWORDS = {
-    3: [r'입퇴원', r'입원', r'퇴원', r'입퇴원확인서', r'입원확인서', r'퇴원확인서'],
-    7: [r'외래', r'통원', r'외래진료', r'통원치료', r'외래확인서'],
-    4: [r'진단서', r'진단명', r'의사진단서', r'진단내용'],
-    14: [r'소견서', r'소견', r'의견서', r'소견내용']
+    3: {
+        'core': [
+            r'입퇴원', r'입\s*퇴원', r'입[ \-–—]*퇴원', r'입원', r'퇴원', r'입원퇴원', r'입원\s*퇴원'
+        ],
+        'wide': [
+            r'입퇴원사실(확인서|증명서|증명원)?', r'입퇴원(확인서|증명서|증명원)',
+            r'입원사실(확인서|증명서|증명원)?', r'입원(확인서|증명서|증명원)', r'퇴원(확인서|증명서|증명원)',
+            r'입원진료확인서', r'입원요약지', r'입원퇴원증명서', r'입원퇴원확인서'
+        ]
+    },
+    7: {
+        'core': [
+            r'통원', r'외래', r'진료', r'치료', r'통원진료', r'외래진료', r'통원치료', r'통원\s*진료', r'외래\s*진료'
+        ],
+        'wide': [
+            r'통원(진료확인서|치료사실확인서|치료사실증명서|사실확인서|사실증명서|사실증명원|확인서)?',
+            r'외래진료사실확인서', r'진료사실(확인서|증명서|증명원)', r'통원치료사실확인서',
+            r'진료(입원|통원)?확인서', r'치료확인서', r'확인서'
+        ]
+    },
+    4: {
+        'core': [r'진단서', r'진단명', r'의사진단서', r'진단내용'],
+        'wide': [r'진단(확인서|증명서|증명원)', r'진단소견']
+    },
+    14: {
+        'core': [r'소견서', r'소견', r'의견서', r'소견내용'],
+        'wide': [r'의학적소견', r'소견(확인서|증명서|증명원)']
+    }
 }
 
 def _build_compiled_keywords(tr_cfg):
-    """Merge base KEYWORDS with config extras/removals and compile regex."""
-    # Start with a copy of base keywords
-    merged = {k: list(v) for k, v in KEYWORDS.items()}
-    # Extra keywords from config
+    """Merge base KEYWORDS (with core/wide groups) plus config extras/removals and compile.
+    extra_keywords / remove_keywords apply to 'core' group.
+    CSV file patterns added to 'core'.
+    Returns: { cid: { 'core': [regex,...], 'wide': [regex,...] } }
+    """
+    merged = {}
+    for cid, groups in KEYWORDS.items():
+        merged[cid] = {
+            'core': list(groups.get('core', [])),
+            'wide': list(groups.get('wide', []))
+        }
     extra = tr_cfg.get('extra_keywords', {}) or {}
     for k, pats in extra.items():
         try:
             cid = int(k)
         except Exception:
-            cid = int(k) if isinstance(k, int) else None
-        if cid is None:
             continue
-        merged.setdefault(cid, [])
+        merged.setdefault(cid, {'core': [], 'wide': []})
         for p in (pats or []):
-            if p not in merged[cid]:
-                merged[cid].append(p)
-    # Remove keywords
+            if p not in merged[cid]['core']:
+                merged[cid]['core'].append(p)
     remove = tr_cfg.get('remove_keywords', {}) or {}
     for k, pats in remove.items():
         try:
             cid = int(k)
         except Exception:
-            cid = int(k) if isinstance(k, int) else None
-        if cid is None or cid not in merged:
             continue
-        merged[cid] = [p for p in merged[cid] if p not in set(pats or [])]
-    # Optional: load from CSV (class,pattern)
+        if cid not in merged:
+            continue
+        merged[cid]['core'] = [p for p in merged[cid]['core'] if p not in set(pats or [])]
     kw_file = tr_cfg.get('keyword_file', '')
     if kw_file and os.path.exists(kw_file):
         try:
             df = pd.read_csv(kw_file)
-            # Expect columns: class, pattern
             cc = [c for c in df.columns if str(c).lower() in ['class','cls','label','y']]
             pc = [c for c in df.columns if str(c).lower() in ['pattern','regex','keyword']]
             if cc and pc:
@@ -132,28 +170,34 @@ def _build_compiled_keywords(tr_cfg):
                     pat = str(r[pcol]) if pd.notna(r[pcol]) else ''
                     if not pat:
                         continue
-                    merged.setdefault(cid, [])
-                    if pat not in merged[cid]:
-                        merged[cid].append(pat)
+                    merged.setdefault(cid, {'core': [], 'wide': []})
+                    if pat not in merged[cid]['core']:
+                        merged[cid]['core'].append(pat)
         except Exception:
             pass
-    # Compile
-    compiled = {cid: [re.compile(p) for p in pats] for cid, pats in merged.items()}
+    compiled = {}
+    for cid, groups in merged.items():
+        compiled[cid] = {
+            'core': [re.compile(p) for p in groups.get('core', [])],
+            'wide': [re.compile(p) for p in groups.get('wide', [])]
+        }
     return compiled
 
-def _count_hits(text, cls_id, compiled_kw=None, norm_opts=None):
-    """Count keyword matches for a class using compiled regex if provided."""
-    if compiled_kw is None:
-        pats = KEYWORDS.get(cls_id, [])
-        compiled = [re.compile(p) for p in pats]
-    else:
-        compiled = compiled_kw.get(cls_id, [])
+def _count_hits_groups(text, cls_id, compiled_kw=None, norm_opts=None):
+    """Return (core_hits, wide_hits) for a class."""
     norm = _normalize_text(text, norm_opts)
-    count = 0
-    for rgx in compiled:
-        if rgx.search(norm):
-            count += 1
-    return count
+    if compiled_kw is None:
+        # build ad-hoc
+        groups = KEYWORDS.get(cls_id, {})
+        core = [re.compile(p) for p in groups.get('core', [])]
+        wide = [re.compile(p) for p in groups.get('wide', [])]
+    else:
+        entry = compiled_kw.get(cls_id, {'core': [], 'wide': []})
+        core = entry.get('core', [])
+        wide = entry.get('wide', [])
+    hc = sum(1 for rgx in core if rgx.search(norm))
+    hw = sum(1 for rgx in wide if rgx.search(norm))
+    return hc, hw
 
 def _load_ocr_map(csv_path, id_col='id'):
     """Load OCR text map from CSV."""
@@ -175,17 +219,30 @@ def _load_ocr_map(csv_path, id_col='id'):
     return ocr_map
 
 def apply_keyword_routing(cfg, test_ds, probs_img, preds):
-    """Apply OCR keyword routing for near-boundary pairs (3,7) and (4,14)."""
+    """Apply OCR keyword routing with two-stage (strict/wide) gating.
+
+    Stage 1 (strict): very near-boundary only, relies on core keyword hits.
+    Stage 2 (wide): a bit wider boundary window but requires stronger evidence
+    (entropy/margin gating) and allows combined (core+wide) hits.
+    """
     tr_cfg = cfg.get('text_routing', {}) or {}
     if not tr_cfg.get('enable', False):
         return preds
     
     source = tr_cfg.get('source', '')
     pairs = tr_cfg.get('pairs', [[3,7], [4,14]])
-    delta_thr = float(tr_cfg.get('delta_thr', 0.04))
-    conf_thr = float(tr_cfg.get('conf_thr', 0.55))
-    min_hits = int(tr_cfg.get('min_hits', 2))
+    # Backward-compat fallbacks
+    delta_thr_strict = float(tr_cfg.get('delta_thr_strict', tr_cfg.get('delta_thr', 0.04)))
+    conf_thr_strict  = float(tr_cfg.get('conf_thr_strict',  tr_cfg.get('conf_thr', 0.55)))
+    min_hits_strict  = int(tr_cfg.get('min_hits_strict',    tr_cfg.get('min_hits', 2)))
+
+    delta_thr_wide   = float(tr_cfg.get('delta_thr_wide',   max(delta_thr_strict, 0.08)))
+    conf_thr_wide    = float(tr_cfg.get('conf_thr_wide',    max(conf_thr_strict,  0.55)))
+    min_hits_wide    = int(tr_cfg.get('min_hits_wide',      max(min_hits_strict+1, 3)))
+    entropy_thr_wide = float(tr_cfg.get('entropy_thr_wide', 1e9))
+    margin_thr_wide  = float(tr_cfg.get('margin_thr_wide',  1e9))
     prefer_top = bool(tr_cfg.get('prefer_top', True))
+    easy_exclude = bool(tr_cfg.get('easy_exclude', True))
     
     # Load OCR map
     ocr_map = _load_ocr_map(source)
@@ -210,82 +267,147 @@ def apply_keyword_routing(cfg, test_ds, probs_img, preds):
 
     routed = 0
     new_preds = preds.copy()
-    
-    total_near = 0
+
+    # Precompute global entropy/margin for gating
+    eps = 1e-9
+    ent = -(probs_img * np.log(probs_img + eps)).sum(1)
+    part = np.partition(-probs_img, 1, axis=1)
+    top1 = -part[:,0]; top2 = -part[:,1]
+    margin = top1 - top2
+
+    # Stats
+    total_near_strict = 0
+    total_near_wide = 0
     total_locked = 0
     total_eligible = 0
     hit_route = 0
     tie_route = 0
+    stage_counts = {'strict': 0, 'wide': 0}
 
     for (a, b) in pairs:
         pa = probs_img[:, a]
         pb = probs_img[:, b]
         delta = np.abs(pa - pb)
         max_conf = np.maximum(pa, pb)
-        
-        # Near-boundary mask
-        near_mask = (delta < delta_thr) & (max_conf > conf_thr)
-        near_idx = np.where(near_mask)[0]
-        total_near += len(near_idx)
-        
-        for i in near_idx:
+
+        # Stage 1: strict
+        mask_strict = (delta < delta_thr_strict) & (max_conf > conf_thr_strict)
+        idx_strict = np.where(mask_strict)[0]
+        total_near_strict += len(idx_strict)
+
+        for i in idx_strict:
             pred_cls = preds[i]
-            conf = probs_img[i, pred_cls]
-            
-            # Easy-Lock check
-            locked = False
-            if pred_cls in easy_classes:
+            conf_i = probs_img[i, pred_cls]
+
+            # Easy-Lock exclusion
+            if easy_exclude and (pred_cls in easy_classes):
                 threshold = float(easy_conf_map.get(str(pred_cls), easy_conf))
-                if conf >= threshold:
-                    locked = True
-            
-            if locked:
-                total_locked += 1
-                continue
-            
+                if conf_i >= threshold:
+                    total_locked += 1
+                    continue
+
             total_eligible += 1
-            # Get OCR text for this image
+            # OCR text
             img_id = str(test_ds.df.iloc[i][test_ds.id_col])
             ocr_text = ocr_map.get(img_id, '')
-            
-            # Count keyword hits for both classes
-            hits_a = _count_hits(ocr_text, a, compiled_kw=compiled_kw, norm_opts=norm_opts)
-            hits_b = _count_hits(ocr_text, b, compiled_kw=compiled_kw, norm_opts=norm_opts)
-            
-            # Route if sufficient hits
-            if max(hits_a, hits_b) >= min_hits:
+
+            # Hits: strict prefers core patterns only
+            core_a, wide_a = _count_hits_groups(ocr_text, a, compiled_kw=compiled_kw, norm_opts=norm_opts)
+            core_b, wide_b = _count_hits_groups(ocr_text, b, compiled_kw=compiled_kw, norm_opts=norm_opts)
+
+            eff_a = core_a if core_a >= min_hits_strict else 0
+            eff_b = core_b if core_b >= min_hits_strict else 0
+
+            if max(eff_a, eff_b) > 0:
                 reason = ''
-                if hits_a > hits_b:
-                    new_preds[i] = a
-                    routed += 1
-                    hit_route += 1
-                    reason = 'hits_a'
-                elif hits_b > hits_a:
-                    new_preds[i] = b
-                    routed += 1
-                    hit_route += 1
-                    reason = 'hits_b'
+                if eff_a > eff_b:
+                    new_preds[i] = a; routed += 1; hit_route += 1; stage_counts['strict'] += 1
+                    reason = 'strict_hits_a_core'
+                elif eff_b > eff_a:
+                    new_preds[i] = b; routed += 1; hit_route += 1; stage_counts['strict'] += 1
+                    reason = 'strict_hits_b_core'
                 elif prefer_top:
-                    # Tie: prefer higher probability
                     new_preds[i] = a if pa[i] >= pb[i] else b
-                    routed += 1
-                    tie_route += 1
-                    reason = 'tie_prefer_top'
+                    routed += 1; tie_route += 1; stage_counts['strict'] += 1
+                    reason = 'strict_tie_prefer_top'
                 if dbg_enable and reason:
                     dbg_rows.append({
                         'id': img_id,
                         'pair': f'{a}-{b}',
+                        'stage': 'strict',
                         'prev_pred': int(pred_cls),
                         'new_pred': int(new_preds[i]),
                         'pa': float(pa[i]), 'pb': float(pb[i]),
                         'delta': float(abs(pa[i]-pb[i])),
-                        'hits_a': int(hits_a), 'hits_b': int(hits_b),
+                        'entropy': float(ent[i]), 'margin': float(margin[i]),
+                        'core_a': int(core_a), 'wide_a': int(wide_a),
+                        'core_b': int(core_b), 'wide_b': int(wide_b),
+                        'min_hits_strict': int(min_hits_strict),
+                        'reason': reason
+                    })
+
+        # Stage 2: wide (delta in [strict, wide), plus entropy/margin gating)
+        mask_wide = (delta < delta_thr_wide) & (delta >= delta_thr_strict) & (max_conf > conf_thr_wide)
+        # entropy/margin gating
+        mask_wide = mask_wide & (ent > entropy_thr_wide) & (margin < margin_thr_wide)
+        idx_wide = np.where(mask_wide)[0]
+        total_near_wide += len(idx_wide)
+
+        for i in idx_wide:
+            pred_cls = preds[i]
+            conf_i = probs_img[i, pred_cls]
+
+            # Easy-Lock exclusion
+            if easy_exclude and (pred_cls in easy_classes):
+                threshold = float(easy_conf_map.get(str(pred_cls), easy_conf))
+                if conf_i >= threshold:
+                    total_locked += 1
+                    continue
+
+            total_eligible += 1
+            img_id = str(test_ds.df.iloc[i][test_ds.id_col])
+            ocr_text = ocr_map.get(img_id, '')
+
+            core_a, wide_a = _count_hits_groups(ocr_text, a, compiled_kw=compiled_kw, norm_opts=norm_opts)
+            core_b, wide_b = _count_hits_groups(ocr_text, b, compiled_kw=compiled_kw, norm_opts=norm_opts)
+
+            total_a = core_a + wide_a
+            total_b = core_b + wide_b
+            eff_a = core_a if core_a >= min_hits_strict else (total_a if total_a >= min_hits_wide else 0)
+            eff_b = core_b if core_b >= min_hits_strict else (total_b if total_b >= min_hits_wide else 0)
+
+            if max(eff_a, eff_b) > 0:
+                reason = ''
+                if eff_a > eff_b:
+                    new_preds[i] = a; routed += 1; hit_route += 1; stage_counts['wide'] += 1
+                    reason = 'wide_hits_a'
+                elif eff_b > eff_a:
+                    new_preds[i] = b; routed += 1; hit_route += 1; stage_counts['wide'] += 1
+                    reason = 'wide_hits_b'
+                elif prefer_top:
+                    new_preds[i] = a if pa[i] >= pb[i] else b
+                    routed += 1; tie_route += 1; stage_counts['wide'] += 1
+                    reason = 'wide_tie_prefer_top'
+                if dbg_enable and reason:
+                    dbg_rows.append({
+                        'id': img_id,
+                        'pair': f'{a}-{b}',
+                        'stage': 'wide',
+                        'prev_pred': int(pred_cls),
+                        'new_pred': int(new_preds[i]),
+                        'pa': float(pa[i]), 'pb': float(pb[i]),
+                        'delta': float(abs(pa[i]-pb[i])),
+                        'entropy': float(ent[i]), 'margin': float(margin[i]),
+                        'core_a': int(core_a), 'wide_a': int(wide_a),
+                        'core_b': int(core_b), 'wide_b': int(wide_b),
+                        'min_hits_strict': int(min_hits_strict), 'min_hits_wide': int(min_hits_wide),
                         'reason': reason
                     })
     
     # One-line summaries (always print)
-    print(f"[KeywordRouting] Near-boundary candidates: {total_near}, locked: {total_locked}, eligible: {total_eligible}")
-    print(f"[KeywordRouting] Routed: {routed} (by hits: {hit_route}, by tie→top: {tie_route}), pairs={pairs}, thr(delta<{delta_thr}, conf>{conf_thr}, min_hits>={min_hits})")
+    print(f"[KeywordRouting] Candidates strict={total_near_strict}, wide={total_near_wide}, locked: {total_locked}, eligible: {total_eligible}")
+    print(f"[KeywordRouting] Routed: {routed} (by hits: {hit_route}, by tie→top: {tie_route}) | per-stage: {stage_counts} | pairs={pairs}")
+    print(f"[KeywordRouting] thr: strict(delta<{delta_thr_strict}, conf>{conf_thr_strict}, min_core>={min_hits_strict}) | wide(delta<{delta_thr_wide}, conf>{conf_thr_wide}, ent>{entropy_thr_wide}, mar<{margin_thr_wide}, min_core>={min_hits_strict} or min_total>={min_hits_wide})")
     # Save debug CSV if enabled
     if dbg_enable and dbg_rows:
         try:

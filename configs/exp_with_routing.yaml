@@ -8,7 +8,8 @@ paths:
   sample_csv: /root/cv_project/data/sample_submission.csv
   train_dir: /root/cv_project/data/train
   test_dir: /root/cv_project/data/test
-  out_dir: /root/cv_project/outputs/full_mult4_with_routing
+  # Use existing checkpoints under full_mult4; we'll copy results out after run
+  out_dir: /root/cv_project/outputs/full_mult4
 
 data:
   img_size: 640
@@ -52,9 +53,9 @@ inference:
       - { name: strong, clahe_clip: 2.2, unsharp_amount: 0.7, deskew: true,  gamma: 1.05 }
 
 ensemble:
-  easy_classes: [0,2,5,8,9,15,16]
+  easy_classes: [0,1,2,5,6,8,9,15,16]
   easy_conf: 0.92
-  easy_conf_map: { "0":0.90, "2":0.92, "5":0.92, "8":0.92, "9":0.90, "15":0.92, "16":0.92 }
+  easy_conf_map: { "0":0.90, "1":0.92, "2":0.92, "5":0.92, "6":0.90, "8":0.92, "9":0.90, "15":0.92, "16":0.92 }
 
 meta_gate:
   entropy_thr: 1.4
@@ -78,11 +79,27 @@ pair_gate:
 text_routing:
   enable: true
   source: /root/cv_project/extern/ocr_text.csv
-  pairs: [[3,7], [4,14]]
-  delta_thr: 0.04
-  conf_thr: 0.55
-  min_hits: 2
+  pairs: [[3,7],[4,14]]
+  # Strict stage: very near-boundary only (lowered conf to actually find candidates)
+  delta_thr_strict: 0.06
+  conf_thr_strict: 0.35
+  min_hits_strict: 2
+  # Wide stage: wider boundary with stronger gating (lowered conf_thr)
+  delta_thr_wide: 0.15
+  conf_thr_wide: 0.40
+  min_hits_wide: 3
+  entropy_thr_wide: 1.55
+  margin_thr_wide: 0.12
   prefer_top: true
+  easy_exclude: true
+  normalization:
+    to_lower: true
+    remove_spaces: false
+    remove_punct: true
+    remove_digits: true
+    nfkc: true
+    keep_hyphens: true
+    collapse_repeats: true
   debug:
     enable: true
     csv_path: /root/cv_project/outputs/full_mult4_with_routing/keyword_routing_debug.csv

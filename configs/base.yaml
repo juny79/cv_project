@@ -53,9 +53,9 @@ inference:
       - { name: strong, clahe_clip: 2.2, unsharp_amount: 0.7, deskew: true,  gamma: 1.05 }
 
 ensemble:
-  easy_classes: [0,2,5,8,9,15,16]
+  easy_classes: [0,1,2,5,6,8,9,15,16]
   easy_conf: 0.92
-  easy_conf_map: { "0":0.90, "2":0.92, "5":0.92, "8":0.92, "9":0.90, "15":0.92, "16":0.92 }
+  easy_conf_map: { "0":0.90, "1":0.92, "2":0.92, "5":0.92, "6":0.90, "8":0.92, "9":0.90, "15":0.92, "16":0.92 }
 
 meta_gate:
   entropy_thr: 1.4    # 엔트로피 상한 (이보다 크면 불확실)
@@ -78,12 +78,12 @@ pair_gate:
 
 text_routing:
   enable: true
-  source: /root/cv_project/extern/ocr_text.csv   # id, text 열이 있는 CSV (미존재 시 자동 건너뜀)
+  source: "extern/ocr_text.csv"
   pairs: [[3,7], [4,14]]
-  delta_thr: 0.04     # |p_a - p_b| < 0.04 (초근접)
-  conf_thr: 0.55      # max(p_a, p_b) > 0.55
-  min_hits: 2         # 라우팅 채택에 필요한 키워드 히트 수
-  prefer_top: true    # 동률이면 top-prob 쪽 유지
+  delta_thr: 0.12
+  conf_thr: 0.50
+  min_hits: 1
+  min_hits_wide: 2
   # 추가 설정 (선택적)
   # extra_keywords: { "3": ["입원증명"], "7": ["외래접수"], "4": ["진단내역"], "14": ["의학적소견"] }
   # remove_keywords: { "3": ["퇴원확인서"] }
