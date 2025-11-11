@@ -80,10 +80,10 @@ text_routing:
   enable: true
   source: /root/cv_project/extern/ocr_text.csv
   pairs: [[3,7],[4,14]]
-  # Strict stage: very near-boundary only (lowered conf to actually find candidates)
+  # Strict stage: very near-boundary only (lowered conf + min_hits to 1 for initial testing)
   delta_thr_strict: 0.06
   conf_thr_strict: 0.35
-  min_hits_strict: 2
+  min_hits_strict: 1
   # Wide stage: wider boundary with stronger gating (lowered conf_thr)
   delta_thr_wide: 0.15
   conf_thr_wide: 0.40
@@ -100,6 +100,21 @@ text_routing:
     nfkc: true
     keep_hyphens: true
     collapse_repeats: true
+  ocr_runtime:
+    enable: true
+    min_text_length: 10
+    upscale_factor: 2.0
+    clahe_clip: 2.0
+    unsharp_amount: 0.5
+    adaptive_method: sauvola
+    deskew: true
+    denoise: true
+    gamma: 1.0
+    use_title_region: true
+    use_multi_engine: false
+    use_easyocr: false
+    use_paddleocr: false
+    psm_modes: [6, 4, 11]
   debug:
     enable: true
     csv_path: /root/cv_project/outputs/full_mult4_with_routing/keyword_routing_debug.csv
