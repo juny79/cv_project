@@ -1,0 +1,160 @@
+# ===============================================================
+# 🚀 layout_gate8_exploit.yaml
+# 목표: leaderboard 0.98+ (공격적 post-hoc fusion)
+# ===============================================================
+
+seed: 42
+device: auto
+num_workers: 2
+
+paths:
+  base_dir: /root/cv_project/data
+  train_csv: /root/cv_project/data/train.csv
+  sample_csv: /root/cv_project/data/sample_submission.csv
+  train_dir: /root/cv_project/data/train
+  test_dir: /root/cv_project/data/test
+  out_dir: /root/cv_project/outputs/layout_gate8
+
+data:
+  img_size: 640
+  folds: [0,1,2,3,4]
+  n_splits: 5
+  tta: 8              # ⬆ 45° 포함 8방향 TTA로 예측 다양성 강화
+  aug_multiplier: 8
+
+model:
+  name: convnext_tiny.fb_in22k_ft_in1k
+  pretrained: true
+  dropout: 0.1
+  label_smoothing: 0.05
+
+train:
+  epochs: 12
+  batch_size: 32
+  lr: 3e-4
+  weight_decay: 1e-4
+  scheduler: cosine
+  early_stop_patience: 3
+  amp: true
+  mixup_alpha: 0.2
+  cutmix_alpha: 0.2     # ⬆ 공격적으로 활성화
+  grad_clip: 1.0
+  class_weight: balanced
+
+log:
+  use_wandb: false
+  use_mlflow: false
+
+# ===============================================================
+# 🔹 Inference / Preprocessing
+# ===============================================================
+inference:
+  amp: true
+  batch_size: 32
+  preproc_variants:
+    enable: true
+    combine: max_conf
+    variants:
+      - { name: base,   clahe_clip: 1.9, unsharp_amount: 0.5, deskew: true,  gamma: 1.00 }
+      - { name: mild,   clahe_clip: 1.6, unsharp_amount: 0.3, deskew: true,  gamma: 0.95 }
+      - { name: strong, clahe_clip: 2.2, unsharp_amount: 0.7, deskew: true,  gamma: 1.05 }
+
+# ===============================================================
+# 🔹 Easy-Lock (Option 1b: add 11/12, tighten thresholds)
+# ===============================================================
+ensemble:
+  easy_classes: [1,14,13,8,10,5,0]
+  easy_conf: 0.95
+  easy_conf_map: { "1":0.95, "14":0.95, "13":0.95, "8":0.95, "10":0.95, "5":0.95, "0":0.95 }
+
+# ===============================================================
+# 🔹 Meta-Gate (불확실 구간 확대)
+# ===============================================================
+meta_gate:
+  entropy_thr: 1.3          # ⬇ 더 넓은 범위에 meta 적용 (완화)
+  margin_thr: 0.15           # ⬆ top2 확률 근접 시 더 적극 개입 (완화)
+
+# ===============================================================
+# 🔹 Advanced Postprocess (risk-focused flips for 3/7)
+#  - 낮은 margin + 중간 entropy + top1_conf 낮은 샘플에서 2nd-best로 뒤집기 시도
+#  - easy lock 된 고확신 샘플은 제외
+# ===============================================================
+postprocess:
+  enable: true
+  class_a: 3
+  class_b: 7
+  delta_threshold: 0.04
+  confidence_threshold: 0.55
+  prefer: higher
+  advanced_flip:
+    enable: true
+    target_classes: [3,7,4,14]
+    margin_thr: 0.08          # top1-top2 좁은 경우만 (완화)
+    entropy_thr: 0.25         # 너무 낮은 entropy(이미 확신) 제외 (완화)
+    top1_conf_max: 0.96       # 확신이 과도하게 높은 경우 제외 (완화)
+    second_gain_min: 0.025    # 2nd-best가 top1에 매우 근접 (완화)
+
+# ===============================================================
+# 🔹 OCR Keyword Routing (공격적)
+# ===============================================================
+text_routing:
+  enable: false
+  source: /root/cv_project/extern/ocr_text.csv
+  pairs: [[3,7], [4,14]]
+  delta_thr_strict: 0.06
+  conf_thr_strict: 0.50
+  min_hits_strict: 2
+  delta_thr_wide: 0.10
+  conf_thr_wide: 0.45
+  min_hits_wide: 2
+  entropy_thr_wide: 1.3
+  margin_thr_wide: 0.15
+  prefer_top: true
+  easy_exclude: true          # Easy-Lock 충족 시 라우팅 제외 (일관성 보장)
+  normalization:
+    nfkc: true
+    remove_spaces: true
+    collapse_repeats: true
+  debug:
+    enable: true
+    csv_path: /root/cv_project/outputs/exp_layout_gate8/ocr_debug.csv
+
+# ===============================================================
+# 🔹 Text-Gate (OCR 없는 샘플용)
+# ===============================================================
+text_gate:
+  enable: true
+  pairs: [[3,7], [4,14]]
+  delta_thr: 0.12             # ⬆ 판단 경계 완화
+  conf_thr: 0.25              # ⬇ 낮은 확신도에도 개입 허용
+  prefer_higher: true
+
+# ===============================================================
+# 🔹 LayoutLMv3 Refiner (핵심 강화)
+# ===============================================================
+layout_refiner:
+  enable: true
+  model_name: microsoft/layoutlmv3-base
+  ckpt_dir_3_7: /root/cv_project/extern/layout_pair_3_7
+  ckpt_dir_4_14: /root/cv_project/extern/layout_pair_4_14
+  delta_thr: 0.08              # ⬆ 더 넓은 근접 범위 허용
+  conf_thr: 0.50               # ⬇ 낮은 확신도에서도 개입
+  entropy_thr: 1.3             # ⬇ 불확실성 기준 완화
+  margin_thr: 0.15             # ⬆ top-2 근접시 refiner 작동
+  ocr_backend: paddle
+  ocr_min_word_len: 2
+  max_words: 512
+  use_title_roi: true
+  title_ratio: 0.20
+  debug_csv: /root/cv_project/outputs/exp_layout_gate8/layout_refiner_debug.csv
+
+# ===============================================================
+# 🔹 Pair-Gate (Meta+Layout 결합)
+# ===============================================================
+pair_gate:
+  enable: true
+  delta_thr: 0.07
+  conf_thr: 0.50
+  entropy_thr: 1.2
+  margin_thr: 0.12
+
